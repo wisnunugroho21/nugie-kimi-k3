@@ -15,10 +15,10 @@ fraction of the KV-cache and compute cost.
   • KDA layers carry positional information implicitly through their recurrence,
     so the full-attention layers need NO positional encoding. Hence the MLA layers
     here are NoPE (see multi_latent_attention/attention.py).
-  • Every layer's channel mixer (FFN) is a DeepSeek-V3 / Moonlight-style MoE —
-    by default in its LatentMoE form (arXiv:2601.18089; the basis of Kimi K3's
-    "Stable LatentMoE"): routed experts run in a shared low-rank latent with
-    α-scaled expert count/top-k at iso-cost. See multi_latent_attention/latent_moe.py.
+  • Every layer's channel mixer (FFN) is a LatentMoE (arXiv:2601.18089; the
+    basis of Kimi K3's "Stable LatentMoE"): a DeepSeek-V3 / Moonlight-style
+    MoE whose routed experts run in a shared low-rank latent with α-scaled
+    expert count/top-k at iso-cost. See multi_latent_attention/latent_moe.py.
 
 THIS FILE'S ONE DELIBERATE SUBSTITUTION
 ---------------------------------------
@@ -81,7 +81,6 @@ from jax.typing import ArrayLike
 from gated_deltanet_2.layer import GatedDeltaNet2, GDN2Cache, RMSNorm
 from multi_latent_attention.attention import GroupedQueryLatentAttention, MLACache
 from multi_latent_attention.latent_moe import LatentMoE
-from multi_latent_attention.moe import GroupedGemmMoE
 
 # App. D.5: Xavier-uniform init with gain 2^{-2.5} (variance_scaling scale = gain² =
 # 2^{-5}) for the embedding and LM head, replacing Flax NNX's defaults. The (small)
@@ -141,15 +140,12 @@ class KimiLinearConfig:
     max_seq_len: int = 512
 
     # --- Channel mixer (FFN): LatentMoE (arXiv:2601.18089) ---
-    # moe_latent=True runs the routed experts in a shared low-rank latent of
-    # width moe_d_latent (see multi_latent_attention/latent_moe.py). Following
-    # the paper's iso-cost recipe at compression α = d_model/moe_d_latent = 4,
-    # BOTH the expert count and top-k scale by α versus the full-width MoE this
-    # repo used before (2-of-8 -> 8-of-32; K3 itself: 8-of-384 -> 16-of-896-ish):
-    # per-expert cost shrinks by α, so total/active expert cost is unchanged.
-    # moe_latent=False restores the full-width GroupedGemmMoE (then moe_d_latent
-    # is ignored, and 32-of-8-style counts should be scaled back down by hand).
-    moe_latent: bool = True
+    # The routed experts run in a shared low-rank latent of width moe_d_latent
+    # (see multi_latent_attention/latent_moe.py). Following the paper's iso-cost
+    # recipe at compression α = d_model/moe_d_latent = 4, BOTH the expert count
+    # and top-k scale by α versus the full-width MoE this repo used before
+    # (2-of-8 -> 8-of-32; K3 itself: 8-of-384 -> 16-of-896-ish): per-expert
+    # cost shrinks by α, so total/active expert cost is unchanged.
     moe_d_latent: int = 64  # shared expert-latent width ℓ (= d_model/4)
     moe_d_ff: int = 512  # per-expert hidden width (inside the latent when moe_latent)
     moe_n_routed: int = 32  # number of routed experts E (α-scaled; K3: 896)
@@ -276,33 +272,21 @@ class DecoderLayer(nnx.Module):
         self.norm2 = RMSNorm(cfg.d_model, eps=cfg.rms_eps, rngs=rngs)
 
         # Channel mixer: LatentMoE (routed experts in a shared low-rank latent,
-        # arXiv:2601.18089) or the full-width GroupedGemmMoE. Both share the
-        # same routing machinery and aux contract, so nothing downstream cares.
-        if cfg.moe_latent:
-            self.channel_mixer = LatentMoE(
-                d_model=cfg.d_model,
-                d_latent=cfg.moe_d_latent,
-                d_ff=cfg.moe_d_ff,
-                n_routed=cfg.moe_n_routed,
-                n_shared=cfg.moe_n_shared,
-                top_k=cfg.moe_top_k,
-                n_groups=cfg.moe_n_groups,
-                topk_groups=cfg.moe_topk_groups,
-                compute_dtype=cfg.cdtype,
-                rngs=rngs,
-            )
-        else:
-            self.channel_mixer = GroupedGemmMoE(
-                d_model=cfg.d_model,
-                d_ff=cfg.moe_d_ff,
-                n_routed=cfg.moe_n_routed,
-                n_shared=cfg.moe_n_shared,
-                top_k=cfg.moe_top_k,
-                n_groups=cfg.moe_n_groups,
-                topk_groups=cfg.moe_topk_groups,
-                compute_dtype=cfg.cdtype,
-                rngs=rngs,
-            )
+        # arXiv:2601.18089). Shares GroupedGemmMoE's routing machinery and aux
+        # contract, so the training loop (aux_loss, update_router_bias) is
+        # unchanged from the full-width MoE this repo used before.
+        self.channel_mixer = LatentMoE(
+            d_model=cfg.d_model,
+            d_latent=cfg.moe_d_latent,
+            d_ff=cfg.moe_d_ff,
+            n_routed=cfg.moe_n_routed,
+            n_shared=cfg.moe_n_shared,
+            top_k=cfg.moe_top_k,
+            n_groups=cfg.moe_n_groups,
+            topk_groups=cfg.moe_topk_groups,
+            compute_dtype=cfg.cdtype,
+            rngs=rngs,
+        )
 
     # -- shared per-sub-layer plumbing ------------------------------------- #
     def _mix_in(
