@@ -26,12 +26,34 @@ write gate `w` instead of the single `beta` that KDA/GDN share. Everything else 
 Kimi Linear — the 3:1 hybrid schedule, NoPE MLA, MoE FFN, pre-norm residual blocks
 — is kept as in the paper. See gated_deltanet_2/layer.py for that token mixer.
 
-BLOCK STRUCTURE (standard pre-norm transformer; Fig. 2)
--------------------------------------------------------
-    x = x + TokenMixer(RMSNorm(x))     # TokenMixer = GDN-2 (linear) OR MLA (full)
-    x = x + ChannelMixer(RMSNorm(x))   # ChannelMixer = MoE
+BLOCK STRUCTURE — ATTENTION RESIDUALS (arXiv:2603.15031; Kimi K3's "AttnRes")
+-----------------------------------------------------------------------------
+The standard pre-norm residual stream accumulates every sub-layer output with
+fixed unit weights, so hidden-state magnitude grows O(depth) and early layers
+get diluted. Attention Residuals replaces that fixed accumulation with SOFTMAX
+ATTENTION OVER DEPTH: the input to each sub-layer is a learned, input-dependent
+mixture of preceding representations,
 
-MODEL = Embed -> [DecoderLayer] * n_layers -> RMSNorm -> LM head.
+    h_l = Σ_i softmax_i( w_l · RMSNorm(v_i) ) · v_i
+
+where the v_i are depth-wise sources and w_l is a per-sub-layer learned
+pseudo-query (a single d_model vector — the mechanism's whole parameter cost).
+
+We implement the paper's scalable BLOCK variant (its Fig. 2 pseudocode): layers
+are grouped into blocks; inside a block, sub-layer outputs accumulate into a
+plain partial sum; the depth-attention sources are [token embedding, completed
+block sums, current partial sum]. With AttnRes the per-sub-layer update becomes
+
+    h       = AttnRes(blocks, partial)        # depth-wise softmax mixture
+    out     = SubLayer(RMSNorm(h))            # GDN-2 / MLA / MoE, pre-norm as before
+    partial = partial + out                   # intra-block accumulation
+    (at each block boundary: blocks.append(partial); partial = None)
+
+and a final AttnRes op aggregates all sources before the output norm/LM head.
+AttnRes mixes DEPTH, never positions, so the streaming caches are untouched.
+Set attn_res=False to recover the plain pre-norm residual stream.
+
+MODEL = Embed -> [DecoderLayer] * n_layers (AttnRes backbone) -> RMSNorm -> LM head.
 
 TWO FORWARD MODES
 -----------------
@@ -80,6 +102,15 @@ class KimiLinearConfig:
     # full_attn_period = 4 places one MLA layer every 4th layer (indices 3, 7, ...),
     # i.e. a 3:1 linear:full ratio — exactly Kimi Linear's hybrid recipe (Sec. 3.2).
     full_attn_period: int = 4
+
+    # --- Block Attention Residuals (arXiv:2603.15031) ---
+    # attn_res_layers_per_block counts TRANSFORMER layers (attn+MoE pairs) per
+    # block. The paper's 48B run used 3 (27 layers -> 9 blocks) and recommends
+    # ~8 blocks overall; 2 gives this tiny 8-layer demo 4 blocks + the embedding
+    # = 5 depth-wise sources. attn_res=False restores the plain pre-norm
+    # residual stream (bitwise-identical math to the pre-AttnRes model).
+    attn_res: bool = True
+    attn_res_layers_per_block: int = 2
 
     # --- GDN-2 token mixer (the KDA replacement) — see gated_deltanet_2/layer.py ---
     gdn_num_heads: int = 4  # H key/query heads   (paper 1.3B: 16)
@@ -131,7 +162,46 @@ class KimiLinearConfig:
 
 
 # --------------------------------------------------------------------------- #
-#  One decoder block: pre-norm token mixer + pre-norm channel mixer, both residual.
+#  Attention Residuals operation (arXiv:2603.15031, Eq. 2-4 / Fig. 2).
+#
+#  One per SUB-layer (each attn and each MoE gets its own), plus one final
+#  aggregator before the LM head. Parameters per op: a single pseudo-query
+#  w ∈ R^d and an RMSNorm — the paper's entire per-layer cost.
+# --------------------------------------------------------------------------- #
+class AttnResOp(nnx.Module):
+    """h = Σ_i softmax_i( w · RMSNorm(v_i) ) · v_i over depth-wise sources v_i.
+
+    The pseudo-query MUST be zero-initialized: the initial depth-attention is
+    then uniform over sources, reducing AttnRes to an equal-weight average at
+    the start of training (the paper §5 found nonzero init causes volatility).
+    The RMSNorm on the KEYS stops large-magnitude sources (e.g. block sums that
+    accumulated over many layers) from monopolizing the softmax; the VALUES are
+    mixed un-normalized (Eq. 3: k_i = norm'd, v_i = raw layer/block outputs).
+    """
+
+    def __init__(self, d_model: int, *, eps: float = 1e-5, rngs: nnx.Rngs):
+        self.query = nnx.Param(jnp.zeros((d_model,), jnp.float32))  # w_l (§5: zero)
+        self.norm = RMSNorm(d_model, eps=eps, rngs=rngs)
+
+    def __call__(
+        self, blocks: list[jax.Array], partial: jax.Array | None
+    ) -> jax.Array:
+        """blocks: completed block reps [b_0(embedding), b_1, ...], each [B, L, d];
+        partial: the intra-block partial sum b_n^i, or None at a block start
+        (Eq. 6: the first layer of a block sees only the completed blocks).
+        Depth-wise only — every position attends over its own stack of sources,
+        so this is position-independent and needs no sequence cache."""
+        sources = blocks + ([partial] if partial is not None else [])
+        V = jnp.stack(sources)  # [N, B, L, d]
+        K = self.norm(V.astype(jnp.float32))  # RMSNorm'ed keys, fp32
+        logits = jnp.einsum("d,nbld->nbl", self.query[...], K)
+        alpha = jax.nn.softmax(logits, axis=0)  # depth-wise attention weights
+        return jnp.einsum("nbl,nbld->bld", alpha, V.astype(jnp.float32))
+
+
+# --------------------------------------------------------------------------- #
+#  One decoder block: token mixer + channel mixer, threaded through the Block
+#  AttnRes backbone (or the plain pre-norm residual stream when attn_res=False).
 #
 #  The ONLY thing that varies across layers is the token mixer: GDN-2 (linear) on
 #  most layers, MLA (full attention) on the 3:1 schedule. The channel mixer is a MoE
@@ -142,6 +212,18 @@ class DecoderLayer(nnx.Module):
     def __init__(self, cfg: KimiLinearConfig, layer_idx: int, *, rngs: nnx.Rngs):
         # 3:1 schedule: this layer is full-attention iff it is the last of its period.
         self.is_full_attn = (layer_idx + 1) % cfg.full_attn_period == 0
+
+        # Block AttnRes boundary: this layer OPENS a new block — the previous
+        # block's partial sum is sealed into `blocks` before its token mixer runs.
+        # Layer 0 opens the first block trivially (partial is still None there).
+        self.attn_res = cfg.attn_res
+        self.starts_new_block = layer_idx % cfg.attn_res_layers_per_block == 0
+
+        if cfg.attn_res:
+            # One AttnRes op per sub-layer (paper Fig. 2: the pre-attn and the
+            # pre-MLP mixes each have their own pseudo-query and key-norm).
+            self.attn_res_mixer = AttnResOp(cfg.d_model, eps=cfg.rms_eps, rngs=rngs)
+            self.mlp_res_mixer = AttnResOp(cfg.d_model, eps=cfg.rms_eps, rngs=rngs)
 
         # Pre-norm before the token mixer (Fig. 2). RMSNorm reused from the GDN-2 layer.
         self.norm1 = RMSNorm(cfg.d_model, eps=cfg.rms_eps, rngs=rngs)
@@ -187,55 +269,94 @@ class DecoderLayer(nnx.Module):
             rngs=rngs,
         )
 
-    def __call__(self, x: jax.Array) -> tuple[jax.Array, dict[str, jax.Array]]:
-        """x: [B, L, d_model] -> (x, aux_or_None).
+    # -- shared per-sub-layer plumbing ------------------------------------- #
+    def _mix_in(
+        self, mixer_name: str, blocks: list[jax.Array], partial: jax.Array | None
+    ) -> jax.Array:
+        """Sub-layer input: the AttnRes depth-attention over sources, or — when
+        attn_res=False — their plain sum, which reconstructs the pre-norm
+        residual stream exactly (x = embedding + Σ all sub-layer outputs =
+        Σ completed blocks + partial)."""
+        if self.attn_res:
+            mixer: AttnResOp = getattr(self, mixer_name)
+            return mixer(blocks, partial)
+        acc = blocks[0]
+        for b in blocks[1:]:
+            acc = acc + b
+        return acc if partial is None else acc + partial
 
-        `aux` carries the MoE load-balancing diagnostics the training loop
-        needs (aux loss + per-expert token counts for the router-bias update).
+    def _seal_block(
+        self, blocks: list[jax.Array], partial: jax.Array | None
+    ) -> tuple[list[jax.Array], jax.Array | None]:
+        """At a block boundary, seal the finished block AFTER its last partial
+        sum fed the pre-attn depth-attention (the paper's Eq. 6 ordering)."""
+        if self.starts_new_block and partial is not None:
+            return blocks + [partial], None
+        return blocks, partial
+
+    def __call__(
+        self, blocks: list[jax.Array], partial: jax.Array | None
+    ) -> tuple[list[jax.Array], jax.Array, dict[str, jax.Array]]:
+        """One transformer layer on the Block AttnRes backbone (paper Fig. 2).
+
+        blocks:  [b_0(embedding), b_1, ...], completed block reps, each [B, L, d].
+        partial: intra-block partial sum entering this layer (None at a block start).
+        Returns (blocks, partial, aux); `aux` carries the MoE load-balancing
+        diagnostics the training loop needs (aux loss + per-expert token counts
+        for the router-bias update), unchanged from before.
         """
-        # --- token mixing (residual, pre-norm) ---
-        h = self.norm1(x)
-        h = self.token_mixer(h)
-        x = x + h
+        # --- token mixing (AttnRes input, pre-norm sub-layer) ---
+        h = self._mix_in("attn_res_mixer", blocks, partial)
+        blocks, partial = self._seal_block(blocks, partial)
 
-        # --- channel mixing (residual, pre-norm) ---
-        y = self.norm2(x)
-        m, aux = self.channel_mixer(y)
-        x = x + m
-        return x, aux
+        out = self.token_mixer(self.norm1(h))
+        partial = out if partial is None else partial + out
+
+        # --- channel mixing (AttnRes input, pre-norm sub-layer) ---
+        h = self._mix_in("mlp_res_mixer", blocks, partial)
+        m, aux = self.channel_mixer(self.norm2(h))
+        partial = partial + m
+        return blocks, partial, aux
 
     def init_cache(self, batch_size: int, max_len: int, dtype=jnp.float32):
-        """Per-layer streaming cache: a GDN2Cache (linear layer) or MLACache (MLA)."""
+        """Per-layer streaming cache: a GDN2Cache (linear layer) or MLACache (MLA).
+        AttnRes needs NO cache — it mixes depth, not positions."""
         return self.token_mixer.init_cache(batch_size, max_len, dtype)
 
     def step(
-        self, x: jax.Array, cache: GDN2Cache | MLACache
-    ) -> tuple[jax.Array, GDN2Cache | MLACache]:
-        """Streaming forward for one block. x: [B, L, d_model] -> (x, new_cache).
-        Only the token mixer is stateful; the channel mixer (MoE) is position-wise,
-        so it needs no cache."""
-        h = self.norm1(x)
+        self,
+        blocks: list[jax.Array],
+        partial: jax.Array | None,
+        cache: GDN2Cache | MLACache,
+    ) -> tuple[list[jax.Array], jax.Array, GDN2Cache | MLACache]:
+        """Streaming forward for one layer: identical depth-wise math to
+        __call__, with the token mixer running against its cache. Only the token
+        mixer is stateful; the MoE is position-wise and AttnRes is depth-wise,
+        so neither needs a cache."""
+        h = self._mix_in("attn_res_mixer", blocks, partial)
+        blocks, partial = self._seal_block(blocks, partial)
 
+        hn = self.norm1(h)
         if isinstance(cache, GDN2Cache) and isinstance(
             self.token_mixer, GatedDeltaNet2
         ):
             # GDN-2: fixed-size recurrent state (O(1) per token).
-            h, new_cache = self.token_mixer.step(h, cache)
+            out, new_cache = self.token_mixer.step(hn, cache)
         elif isinstance(cache, MLACache) and isinstance(
             self.token_mixer, GroupedQueryLatentAttention
         ):
             # MLA: growing latent cache (O(context) per token).
-            h, new_cache = self.token_mixer.step(h, cache)
+            out, new_cache = self.token_mixer.step(hn, cache)
         else:
             raise ValueError(
                 f"Cache type {type(cache)} does not match token mixer {type(self.token_mixer)}"
             )
+        partial = out if partial is None else partial + out
 
-        x = x + h
-        y = self.norm2(x)
-        m, _ = self.channel_mixer(y)
-        x = x + m
-        return x, new_cache
+        h = self._mix_in("mlp_res_mixer", blocks, partial)
+        m, _ = self.channel_mixer(self.norm2(h))
+        partial = partial + m
+        return blocks, partial, new_cache
 
 
 # --------------------------------------------------------------------------- #
@@ -257,8 +378,13 @@ class KimiLinear(nnx.Module):
             [DecoderLayer(cfg, i, rngs=rngs) for i in range(cfg.n_layers)]
         )
 
-        # Final pre-head norm + untied LM head (Moonlight/DeepSeek do not tie weights;
-        # to tie, drop lm_head and use `x @ self.embed.embedding.value.T` instead).
+        # Final AttnRes aggregation over all block representations (paper §3.2:
+        # "the final output layer aggregates all N block representations"),
+        # then the final pre-head norm + untied LM head (Moonlight/DeepSeek do
+        # not tie weights; to tie, drop lm_head and use
+        # `x @ self.embed.embedding.value.T` instead).
+        if cfg.attn_res:
+            self.final_res_mixer = AttnResOp(cfg.d_model, eps=cfg.rms_eps, rngs=rngs)
         self.norm_f = RMSNorm(cfg.d_model, eps=cfg.rms_eps, rngs=rngs)
         self.lm_head = nnx.Linear(
             cfg.d_model,
@@ -284,13 +410,19 @@ class KimiLinear(nnx.Module):
             ArrayLike
         ] = []  # one [E] vector per MoE layer, in layer order
 
-        x = self.embed(input_ids)  # [B, L, d_model]
+        # Block AttnRes state: blocks[0] is ALWAYS the token embedding (the
+        # paper's b_0), and the intra-block partial sum starts empty.
+        emb = self.embed(input_ids)  # [B, L, d_model]
+        blocks: list[jax.Array] = [emb]
+        partial: jax.Array | None = None
+
         for layer in self.layers:
-            x, aux = layer(x)
+            blocks, partial, aux = layer(blocks, partial)
 
             aux_loss = aux_loss + aux["aux_loss"]
             group_sizes.append(aux["group_sizes"])
 
+        x = self._final_mix(blocks, partial)
         x = self.norm_f(x)
         # Upcast logits to fp32 for a numerically stable softmax/cross-entropy under
         # bf16 compute (the lm_head matmul itself still runs in cfg.compute_dtype).
@@ -298,10 +430,24 @@ class KimiLinear(nnx.Module):
 
         return logits, {"aux_loss": aux_loss, "group_sizes": jnp.stack(group_sizes)}
 
+    def _final_mix(
+        self, blocks: list[jax.Array], partial: jax.Array | None
+    ) -> jax.Array:
+        """Pre-head aggregation: the final AttnRes op over every depth-wise
+        source, or their plain sum (= the classic residual stream) without it."""
+        if self.cfg.attn_res:
+            return self.final_res_mixer(blocks, partial)
+        acc = blocks[0]
+        for b in blocks[1:]:
+            acc = acc + b
+        return acc if partial is None else acc + partial
+
     # ----------------------------------------------------------------------- #
     #  Streaming / inference.  Each layer carries its own cache (GDN-2: fixed-size
     #  recurrent state + conv state; MLA: growing latent cache).  Reusing them makes
     #  generation O(1) per token for the linear layers instead of re-reading history.
+    #  AttnRes carries NOTHING across steps — depth-wise mixing is recomputed for
+    #  each new position from that position's own layer outputs.
     # ----------------------------------------------------------------------- #
     def init_cache(
         self, batch_size: int, max_len: int | None = None, dtype=jnp.float32
@@ -316,11 +462,15 @@ class KimiLinear(nnx.Module):
         1 per decoded token). Returns (logits[B, L, vocab], new_caches)."""
         new_caches = []
 
-        x = self.embed(input_ids)
+        emb = self.embed(input_ids)
+        blocks: list[jax.Array] = [emb]
+        partial: jax.Array | None = None
+
         for layer, cache in zip(self.layers, caches):
-            x, new_cache = layer.step(x, cache)
+            blocks, partial, new_cache = layer.step(blocks, partial, cache)
             new_caches.append(new_cache)
 
+        x = self._final_mix(blocks, partial)
         x = self.norm_f(x)
         return self.lm_head(x).astype(jnp.float32), new_caches
 
