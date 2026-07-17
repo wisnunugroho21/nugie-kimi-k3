@@ -81,10 +81,6 @@ TWO FORWARD MODES
     reuses per-layer state across calls so each new token is O(1) work for the GDN-2
     layers (fixed-size recurrent state) and O(context) for the few MLA layers (growing
     latent cache). See GatedDeltaNet2.step / GroupedQueryLatentAttention.step.
-
-NAMING NOTE: the KimiLinear / KimiK3Config class names predate the K3
-upgrade and are kept for checkpoint/import stability; the model they build is
-the K3-style architecture described above.
 """
 
 from __future__ import annotations
@@ -406,11 +402,10 @@ class DecoderLayer(nnx.Module):
 # --------------------------------------------------------------------------- #
 #  The full model.
 # --------------------------------------------------------------------------- #
-class KimiLinear(nnx.Module):
+class KimiK3(nnx.Module):
     """Decoder-only Kimi K3-style LM: Block AttnRes backbone over a 3:1
     GDN-2 (KDA stand-in) : gated-MLA hybrid, with a LatentMoE channel mixer
-    on every layer. (Class name kept from the Kimi Linear starting point —
-    see the module docstring's naming note.)"""
+    on every layer."""
 
     def __init__(self, cfg: KimiK3Config, *, rngs: nnx.Rngs):
         self.cfg = cfg
@@ -567,7 +562,7 @@ class KimiLinear(nnx.Module):
 # --------------------------------------------------------------------------- #
 @nnx.jit
 def _decode_step(
-    model: KimiLinear, tok: jax.Array, caches: list
+    model: KimiK3, tok: jax.Array, caches: list
 ) -> tuple[jax.Array, list]:
     """One greedy decode step: tok int[B, 1] -> (next greedy token int[B, 1], caches)."""
     logits, caches = model.step(tok, caches)
