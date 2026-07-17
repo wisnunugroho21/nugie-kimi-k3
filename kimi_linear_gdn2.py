@@ -127,6 +127,10 @@ class KimiLinearConfig:
     mla_num_q_heads: int = 8  # query heads
     mla_num_kv_heads: int = 2  # KV/latent heads (GQA); q_heads must be a multiple
     mla_head_dim: int = 64  # per-head latent (rank) width
+    # Kimi K3 "Gated MLA + SiTU": head-wise sigmoid(W_g x) ⊙ tanh(o) output gate
+    # on the attention output, before the absorbed out-projection. False = the
+    # plain (pre-K3) MLA.
+    mla_gated: bool = True
     # Declared context cap: checked against the training seq_len and used as the
     # default size of the preallocated MLA latent cache in init_cache/generate.
     # (The MLA causal mask itself is built on the fly from the actual length.)
@@ -229,13 +233,15 @@ class DecoderLayer(nnx.Module):
         self.norm1 = RMSNorm(cfg.d_model, eps=cfg.rms_eps, rngs=rngs)
 
         if self.is_full_attn:
-            # Full attention: NoPE Multi-head Latent Attention (absorbed/GQA form).
+            # Full attention: NoPE Multi-head Latent Attention (absorbed/GQA
+            # form), with the K3 SiTU output gate when mla_gated is set.
             self.token_mixer = GroupedQueryLatentAttention(
                 embed_dim=cfg.d_model,
                 num_q_heads=cfg.mla_num_q_heads,
                 num_kv_heads=cfg.mla_num_kv_heads,
                 head_dim=cfg.mla_head_dim,
                 compute_dtype=cfg.cdtype,
+                gated=cfg.mla_gated,
                 rngs=rngs,
             )
         else:
