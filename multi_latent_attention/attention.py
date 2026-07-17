@@ -12,20 +12,16 @@ softmax attention; this module is that layer, in Kimi Linear's exact flavor:
   * Written in the ABSORBED form (see the class docstring): with no RoPE in the
     way, the K/V up-projections fold into the neighboring matrices exactly, so the
     latent itself serves as both K and V and never gets up-projected at runtime.
-  * OPTIONAL Gated MLA with a Sigmoid Tanh Unit (SiTU), following Kimi K3
-    ("SiTU and Gated MLA improve activation control and attention selectivity"):
-    a head-wise output gate applied to the attention output right before the
-    final (absorbed) output projection,
+  * OPTIONAL Gated MLA (Kimi K3: "Gated MLA improves attention selectivity"):
+    a head-wise sigmoid output gate applied to the attention output right
+    before the final (absorbed) output projection,
 
-        o_gated = sigmoid(W_g x) ⊙ tanh(o)
+        o_gated = sigmoid(W_g x) ⊙ o
 
-    The sigmoid branch is the selectivity gate of the "Gated Attention" lineage
+    This is the selectivity gate of the "Gated Attention" lineage
     (arXiv:2505.06708 — the input-conditioned, head-specific elementwise output
     gate Kimi K2 adopted, which suppresses attention sinks and massive
-    activations); the tanh bounds the attention output to [-1, 1] (activation
-    control). NOTE: the K3 technical report is not yet published — this
-    composition is a documented best-effort reconstruction of "Gated MLA +
-    SiTU" and is isolated behind the `gated` flag (default off).
+    activations). Isolated behind the `gated` flag (default off).
 
 Two paths, same math: `__call__` for full-sequence training (causal-masked matrix
 attention) and `step` for streaming decode (append the new latent to a preallocated
@@ -141,13 +137,13 @@ class GroupedQueryLatentAttention(nnx.Module):
             rngs=rngs,
         )
 
-        # Gated MLA (Kimi K3): SiTU output gate — sigmoid(W_g x) ⊙ tanh(o) —
+        # Gated MLA (Kimi K3): sigmoid output gate — sigmoid(W_g x) ⊙ o —
         # applied to the per-head attention output BEFORE w_uv_o (the G1
         # "before out-projection" position of the Gated Attention paper,
         # head-specific and elementwise over the d_q gate width). With the
         # Xavier gain-2^{-2.5} init the gate starts near sigmoid(0) = 0.5: a
-        # uniform half-open gate, and tanh ≈ identity for small early outputs,
-        # so the init-time behavior is a benignly rescaled ungated MLA.
+        # uniform half-open gate, so the init-time behavior is a benignly
+        # rescaled ungated MLA.
         self.gated = gated
         if gated:
             self.w_gate = nnx.Linear(
@@ -160,13 +156,13 @@ class GroupedQueryLatentAttention(nnx.Module):
                 rngs=rngs,
             )
 
-    def _situ_gate(self, o: jax.Array, x: jax.Array) -> jax.Array:
-        """SiTU: sigmoid(W_g x) ⊙ tanh(o). o: [B, L, Hq*Dh] attention output,
-        x: [B, L, embed_dim] block input. Runs in fp32 so the tanh saturation
-        region is resolved identically in training and decode, then returns to
-        o's dtype for the (possibly bf16) w_uv_o matmul."""
+    def _output_gate(self, o: jax.Array, x: jax.Array) -> jax.Array:
+        """sigmoid(W_g x) ⊙ o. o: [B, L, Hq*Dh] attention output, x: [B, L,
+        embed_dim] block input. The sigmoid is taken in fp32 so training and
+        decode resolve it identically, then returns to o's dtype for the
+        (possibly bf16) w_uv_o matmul."""
         g = jax.nn.sigmoid(self.w_gate(x).astype(F32))
-        return (g * jnp.tanh(o.astype(F32))).astype(o.dtype)
+        return (g * o.astype(F32)).astype(o.dtype)
 
     def __call__(self, x: jax.Array) -> jax.Array:
         # x: (B, T, embed_dim)
@@ -235,9 +231,9 @@ class GroupedQueryLatentAttention(nnx.Module):
             batch_size, seq_length, self.num_q_heads * self.head_dim
         )
 
-        # Gated MLA (K3): SiTU output gate before the absorbed out-projection.
+        # Gated MLA (K3): sigmoid output gate before the absorbed out-projection.
         if self.gated:
-            weighted_latents = self._situ_gate(weighted_latents, x)
+            weighted_latents = self._output_gate(weighted_latents, x)
 
         # Absorbed W_UV . W_O: up-project the value latent and output-project.
         output = self.w_uv_o(weighted_latents)  # (B, T, embed_dim)
@@ -310,11 +306,11 @@ class GroupedQueryLatentAttention(nnx.Module):
             B, L, self.num_q_heads * self.head_dim
         )
 
-        # Gated MLA (K3): same SiTU gate as the training path. The gate depends
-        # only on the CURRENT positions' x — never on past positions — so
-        # streaming needs no extra cache and prefill/decode match training.
+        # Gated MLA (K3): same sigmoid gate as the training path. The gate
+        # depends only on the CURRENT positions' x — never on past positions —
+        # so streaming needs no extra cache and prefill/decode match training.
         if self.gated:
-            weighted = self._situ_gate(weighted, x)
+            weighted = self._output_gate(weighted, x)
 
         output = self.w_uv_o(weighted)  # (B, L, embed_dim)
         return output, MLACache(l_kv, new_pos)
