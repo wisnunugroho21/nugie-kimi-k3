@@ -1,10 +1,17 @@
 """
-Dispatched grouped-GEMM MoE channel mixer for Kimi Linear (JAX / Flax NNX).
+Full-width dispatched grouped-GEMM MoE (JAX / Flax NNX).
 
-Replaces the dense O(E) reference MoE in kimi_linear_gdn2.py with the production
-pattern: permute tokens so each expert's assignments are contiguous (dispatch),
-run one matmul per expert as a single grouped GEMM (`jax.lax.ragged_dot`), then
-un-permute and weighted-sum (combine). No token dropping, no capacity padding.
+ROLE IN THIS PROJECT (a Kimi K3 recreation): the model itself uses the LatentMoE
+subclass (latent_moe.py) as its channel mixer — K3 runs its routed experts in a
+shared low-rank latent. This class remains as (a) the BASE CLASS providing the
+routing (`_route`) and shared-expert (`_shared`) machinery LatentMoE inherits
+verbatim, and (b) the full-width reference MoE (DeepSeek-V3 / Moonlight / Kimi
+K2 style) it is measured against.
+
+The production dispatch pattern, shared by both: permute tokens so each expert's
+assignments are contiguous (dispatch), run one matmul per expert as a single
+grouped GEMM (`jax.lax.ragged_dot`), then un-permute and weighted-sum (combine).
+No token dropping, no capacity padding.
 
 Pipeline per forward:
     1. Route:    sigmoid affinities (+ aux-loss-free bias on the SELECTION only)

@@ -1,36 +1,50 @@
 """
-Kimi Linear (GDN-2 variant) — the top-level decoder-only language model, in JAX /
-Flax NNX. ANNOTATED against "Kimi Linear: An Expressive, Efficient Attention
-Architecture."
+Kimi K3 recreation — the top-level decoder-only language model, in JAX / Flax NNX.
 
-WHAT KIMI LINEAR IS (paper, Sec. 3 / Fig. 2)
---------------------------------------------
-A *hybrid* linear-attention transformer. Most layers use a cheap, O(L) linear-
-attention token mixer (the paper's "Kimi Delta Attention", KDA); a minority use
-ordinary softmax full attention (Multi-head Latent Attention, MLA). The two are
-interleaved at a fixed **3:1 ratio** — three linear layers for every one full-
-attention layer — which the paper finds recovers full-attention quality at a
-fraction of the KV-cache and compute cost.
+This project is our FIRST ATTEMPT at recreating the architecture of Kimi K3
+(Moonshot AI, July 2026 — https://www.kimi.com/blog/kimi-k3). K3's backbone is
+the hybrid linear-attention transformer of "Kimi Linear: An Expressive,
+Efficient Attention Architecture", extended with the K3 architectural features.
+The K3 technical report ships with the model weights; until it lands, each
+feature below is annotated against its best public source.
 
-  • KDA layers carry positional information implicitly through their recurrence,
-    so the full-attention layers need NO positional encoding. Hence the MLA layers
-    here are NoPE (see multi_latent_attention/attention.py).
-  • Every layer's channel mixer (FFN) is a LatentMoE (arXiv:2601.18089; the
-    basis of Kimi K3's "Stable LatentMoE"): a DeepSeek-V3 / Moonlight-style
-    MoE whose routed experts run in a shared low-rank latent with α-scaled
-    expert count/top-k at iso-cost. See multi_latent_attention/latent_moe.py.
+WHAT KIMI K3 IS, AND WHAT THIS MODEL IMPLEMENTS
+-----------------------------------------------
+A hybrid linear-attention transformer with depth-wise attention residuals.
+Most layers use a cheap, O(L) linear-attention token mixer (K3/Kimi Linear:
+"Kimi Delta Attention", KDA); a minority use ordinary softmax full attention
+(Multi-head Latent Attention, MLA). The two interleave at a fixed **3:1 ratio**
+— K3's architecture diagram shows the same 3× KDA : 1× MLA cell as Kimi Linear,
+which found this recovers full-attention quality at a fraction of the KV-cache
+and compute cost.
 
-THIS FILE'S ONE DELIBERATE SUBSTITUTION
----------------------------------------
-We replace KDA with **Gated DeltaNet-2** ("Decoupling Erase and Write in Linear
-Attention", arXiv:2605.22791). Both are gated-delta-rule linear attentions with
-fine-grained (channel-wise) gating; GDN-2's twist is a separate erase gate `b` and
-write gate `w` instead of the single `beta` that KDA/GDN share. Everything else of
-Kimi Linear — the 3:1 hybrid schedule, NoPE MLA, MoE FFN, pre-norm residual blocks
-— is kept as in the paper. See gated_deltanet_2/layer.py for that token mixer.
+Feature-by-feature status of this recreation:
 
-BLOCK STRUCTURE — ATTENTION RESIDUALS (arXiv:2603.15031; Kimi K3's "AttnRes")
------------------------------------------------------------------------------
+  • ATTENTION RESIDUALS (AttnRes) — implemented faithfully from the paper
+    (arXiv:2603.15031, Kimi Team); the Block variant, K3's backbone. See below.
+  • GATED MLA — implemented: a head-wise sigmoid output gate on the MLA layers
+    (the Gated Attention lineage, arXiv:2505.06708; K3: "Gated MLA improves
+    attention selectivity"). The MLA layers are NoPE — the linear-attention
+    layers carry position implicitly through their recurrence, so the
+    full-attention layers need no positional encoding at all.
+    See multi_latent_attention/attention.py.
+  • LatentMoE — implemented, and REQUIRED: every layer's channel mixer (FFN) is
+    a DeepSeek-V3 / Moonlight-style MoE whose routed experts run in a shared
+    low-rank latent with α-scaled expert count/top-k at iso-cost
+    (arXiv:2601.18089 — the design K3's "Stable LatentMoE" builds on).
+    See multi_latent_attention/latent_moe.py.
+  • KIMI DELTA ATTENTION — deliberately SUBSTITUTED with **Gated DeltaNet-2**
+    ("Decoupling Erase and Write in Linear Attention", arXiv:2605.22791). Both
+    are gated-delta-rule linear attentions with fine-grained (channel-wise)
+    gating; GDN-2's twist is a separate erase gate `b` and write gate `w`
+    instead of the single `beta` that KDA/GDN share. This is this recreation's
+    one intentional departure from K3. See gated_deltanet_2/layer.py.
+  • NOT (yet) recreated, pending the K3 technical report: the "Stable" additions
+    and Quantile Balancing of K3's Stable LatentMoE, the Per-Head Muon
+    optimizer, and K3's multimodal / 1M-context / MXFP4 training machinery.
+
+BLOCK STRUCTURE — ATTENTION RESIDUALS (arXiv:2603.15031; K3's backbone)
+-----------------------------------------------------------------------
 The standard pre-norm residual stream accumulates every sub-layer output with
 fixed unit weights, so hidden-state magnitude grows O(depth) and early layers
 get diluted. Attention Residuals replaces that fixed accumulation with SOFTMAX
@@ -42,10 +56,11 @@ mixture of preceding representations,
 where the v_i are depth-wise sources and w_l is a per-sub-layer learned
 pseudo-query (a single d_model vector — the mechanism's whole parameter cost).
 
-We implement the paper's scalable BLOCK variant (its Fig. 2 pseudocode): layers
-are grouped into blocks; inside a block, sub-layer outputs accumulate into a
-plain partial sum; the depth-attention sources are [token embedding, completed
-block sums, current partial sum]. With AttnRes the per-sub-layer update becomes
+We implement the paper's scalable BLOCK variant (its Fig. 2 pseudocode), the
+form K3's diagram labels "Block Attention Residuals": layers are grouped into
+blocks; inside a block, sub-layer outputs accumulate into a plain partial sum;
+the depth-attention sources are [token embedding, completed block sums, current
+partial sum]. With AttnRes the per-sub-layer update becomes
 
     h       = AttnRes(blocks, partial)        # depth-wise softmax mixture
     out     = SubLayer(RMSNorm(h))            # GDN-2 / MLA / MoE, pre-norm as before
@@ -66,6 +81,10 @@ TWO FORWARD MODES
     reuses per-layer state across calls so each new token is O(1) work for the GDN-2
     layers (fixed-size recurrent state) and O(context) for the few MLA layers (growing
     latent cache). See GatedDeltaNet2.step / GroupedQueryLatentAttention.step.
+
+NAMING NOTE: the KimiLinear / KimiK3Config class names predate the K3
+upgrade and are kept for checkpoint/import stability; the model they build is
+the K3-style architecture described above.
 """
 
 from __future__ import annotations
@@ -91,36 +110,39 @@ _XAVIER = nnx.initializers.variance_scaling(2**-5, "fan_avg", "uniform")
 # --------------------------------------------------------------------------- #
 #  Configuration
 #
-#  Defaults are deliberately TINY so the whole model trains on a laptop CPU. The
-#  paper's 48B-A3B numbers are quoted in comments for reference; only the *ratios*
-#  and structure matter for understanding — scale up by raising the dims/layers.
+#  Defaults are deliberately TINY so the whole model trains on a laptop CPU.
+#  Reference numbers quoted in the comments come from the Kimi Linear paper's
+#  1.3B / 48B-A3B configs (K3's own hyperparameters await its technical report);
+#  only the *ratios* and structure matter for understanding — scale up by
+#  raising the dims/layers.
 # --------------------------------------------------------------------------- #
 @dataclasses.dataclass
-class KimiLinearConfig:
-    vocab_size: int = 256  # paper: 160k; tiny here (byte-level demo)
-    d_model: int = 256  # model width  (paper 1.3B: 2048)
-    n_layers: int = 8  # depth        (paper 1.3B: 27)
+class KimiK3Config:
+    vocab_size: int = 256  # Kimi Linear: 160k; tiny here (byte-level demo)
+    d_model: int = 256  # model width  (Kimi Linear 1.3B: 2048)
+    n_layers: int = 8  # depth        (Kimi Linear 1.3B: 27)
 
     # --- Hybrid schedule: which layers are FULL attention (MLA) vs linear (GDN-2) ---
     # full_attn_period = 4 places one MLA layer every 4th layer (indices 3, 7, ...),
-    # i.e. a 3:1 linear:full ratio — exactly Kimi Linear's hybrid recipe (Sec. 3.2).
+    # i.e. a 3:1 linear:full ratio — Kimi Linear's hybrid recipe (its Sec. 3.2),
+    # kept by K3 (the K3 architecture diagram shows the same 3×/1× cell).
     full_attn_period: int = 4
 
-    # --- Block Attention Residuals (arXiv:2603.15031) ---
+    # --- Block Attention Residuals (arXiv:2603.15031) — K3's backbone ---
     # attn_res_layers_per_block counts TRANSFORMER layers (attn+MoE pairs) per
-    # block. The paper's 48B run used 3 (27 layers -> 9 blocks) and recommends
-    # ~8 blocks overall; 2 gives this tiny 8-layer demo 4 blocks + the embedding
-    # = 5 depth-wise sources. attn_res=False restores the plain pre-norm
-    # residual stream (bitwise-identical math to the pre-AttnRes model).
+    # block. The AttnRes paper's 48B run used 3 (27 layers -> 9 blocks) and
+    # recommends ~8 blocks overall; 2 gives this tiny 8-layer demo 4 blocks +
+    # the embedding = 5 depth-wise sources. attn_res=False restores the plain
+    # pre-norm residual stream (bitwise-identical math to a no-AttnRes model).
     attn_res: bool = True
     attn_res_layers_per_block: int = 2
 
-    # --- GDN-2 token mixer (the KDA replacement) — see gated_deltanet_2/layer.py ---
-    gdn_num_heads: int = 4  # H key/query heads   (paper 1.3B: 16)
-    gdn_head_k_dim: int = 64  # d_k                 (paper: 128)
-    gdn_head_v_dim: int = 64  # d_v                 (paper: 128)
+    # --- GDN-2 token mixer (this recreation's KDA stand-in) — see gated_deltanet_2/layer.py ---
+    gdn_num_heads: int = 4  # H key/query heads   (Kimi Linear 1.3B: 16)
+    gdn_head_k_dim: int = 64  # d_k                 (Kimi Linear: 128)
+    gdn_head_v_dim: int = 64  # d_v                 (Kimi Linear: 128)
     gdn_num_v_heads: int | None = None  # H_v for GQA value heads; None -> = num_heads
-    gdn_chunk_size: int = 64  # chunkwise block size C (paper App.: 64).
+    gdn_chunk_size: int = 64  # chunkwise block size C (GDN-2 paper App. C.2: 64).
     #   NOTE: the GDN-2 chunkwise core requires every fed sequence length to be a
     #   multiple of this C (it reshapes L into L/C chunks). Keep seq_len % C == 0.
     gdn_conv_size: int = 4  # short-conv kernel width
@@ -141,13 +163,14 @@ class KimiLinearConfig:
 
     # --- Channel mixer (FFN): LatentMoE (arXiv:2601.18089) ---
     # The routed experts run in a shared low-rank latent of width moe_d_latent
-    # (see multi_latent_attention/latent_moe.py). Following the paper's iso-cost
-    # recipe at compression α = d_model/moe_d_latent = 4, BOTH the expert count
-    # and top-k scale by α versus the full-width MoE this repo used before
-    # (2-of-8 -> 8-of-32; K3 itself: 8-of-384 -> 16-of-896-ish): per-expert
-    # cost shrinks by α, so total/active expert cost is unchanged.
+    # (see multi_latent_attention/latent_moe.py). Following the LatentMoE
+    # paper's iso-cost recipe at compression α = d_model/moe_d_latent = 4, BOTH
+    # the expert count and top-k scale by α versus a full-width MoE (here:
+    # 2-of-8 full-width -> 8-of-32 latent; K3 itself: K2's 8-of-384 -> K3's
+    # 16-of-896): per-expert cost shrinks by α, so the total and active expert
+    # cost is unchanged while accuracy improves.
     moe_d_latent: int = 64  # shared expert-latent width ℓ (= d_model/4)
-    moe_d_ff: int = 512  # per-expert hidden width (inside the latent when moe_latent)
+    moe_d_ff: int = 512  # per-expert hidden width, inside the latent (shared expert: full-width)
     moe_n_routed: int = 32  # number of routed experts E (α-scaled; K3: 896)
     moe_n_shared: int = 1  # always-on shared experts (always full-width)
     moe_top_k: int = 8  # experts activated per token (α-scaled; K3: 16)
@@ -165,8 +188,9 @@ class KimiLinearConfig:
     # Matmul (compute) dtype for the projection Linears + MoE expert GEMMs. Master
     # weights are ALWAYS stored fp32 (param_dtype), and the numerically sensitive
     # parts stay fp32 regardless: the GDN-2 chunkwise core, RMSNorm, the router
-    # softmax, and the loss. Set "bfloat16" on an H200; "float32" disables mixed
-    # precision. Read from YAML as a string; use `.cdtype` for the resolved dtype.
+    # scores, the AttnRes depth-softmax, and the loss. Set "bfloat16" on an H200;
+    # "float32" disables mixed precision. Read from YAML as a string; use
+    # `.cdtype` for the resolved dtype.
     compute_dtype: str = "float32"
 
     @property
@@ -217,12 +241,12 @@ class AttnResOp(nnx.Module):
 #  AttnRes backbone (or the plain pre-norm residual stream when attn_res=False).
 #
 #  The ONLY thing that varies across layers is the token mixer: GDN-2 (linear) on
-#  most layers, MLA (full attention) on the 3:1 schedule. The channel mixer is a MoE
-#  on every layer — this matches Kimi Linear, where the hybrid is in the *attention*,
-#  not the FFN.
+#  most layers, MLA (full attention) on the 3:1 schedule. The channel mixer is a
+#  LatentMoE on every layer — as in K3 (and Kimi Linear before it), the hybrid
+#  is in the *attention*, not the FFN.
 # --------------------------------------------------------------------------- #
 class DecoderLayer(nnx.Module):
-    def __init__(self, cfg: KimiLinearConfig, layer_idx: int, *, rngs: nnx.Rngs):
+    def __init__(self, cfg: KimiK3Config, layer_idx: int, *, rngs: nnx.Rngs):
         # 3:1 schedule: this layer is full-attention iff it is the last of its period.
         self.is_full_attn = (layer_idx + 1) % cfg.full_attn_period == 0
 
@@ -254,7 +278,8 @@ class DecoderLayer(nnx.Module):
                 rngs=rngs,
             )
         else:
-            # Linear attention: Gated DeltaNet-2 (the KDA substitute).
+            # Linear attention: Gated DeltaNet-2 (this recreation's stand-in
+            # for K3's Kimi Delta Attention — see the module docstring).
             self.token_mixer = GatedDeltaNet2(
                 d_model=cfg.d_model,
                 num_heads=cfg.gdn_num_heads,
@@ -382,9 +407,12 @@ class DecoderLayer(nnx.Module):
 #  The full model.
 # --------------------------------------------------------------------------- #
 class KimiLinear(nnx.Module):
-    """Decoder-only Kimi Linear LM with a GDN-2 linear-attention backbone."""
+    """Decoder-only Kimi K3-style LM: Block AttnRes backbone over a 3:1
+    GDN-2 (KDA stand-in) : gated-MLA hybrid, with a LatentMoE channel mixer
+    on every layer. (Class name kept from the Kimi Linear starting point —
+    see the module docstring's naming note.)"""
 
-    def __init__(self, cfg: KimiLinearConfig, *, rngs: nnx.Rngs):
+    def __init__(self, cfg: KimiK3Config, *, rngs: nnx.Rngs):
         self.cfg = cfg
         # Token embedding table.
         self.embed = nnx.Embed(
