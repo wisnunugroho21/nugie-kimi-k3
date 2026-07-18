@@ -4,7 +4,7 @@ Experiment configuration for the Kimi-Linear-GDN2 code LM.
 One YAML file drives the whole pipeline (prepare_data -> train -> evaluate). It is
 split into three logical groups, all flat in the YAML for convenience:
 
-  * `model:`  -> a KimiLinearConfig (the architecture, from kimi_linear_gdn2.py).
+  * `model:`  -> a KimiLinearConfig (the architecture, from kimi_k3_gdn2.py).
   * `data:`   -> where the tokenized CodeParrot memmaps live + how to build them.
   * `train:`  -> optimizer / schedule / checkpoint / logging knobs.
 
@@ -21,7 +21,7 @@ from typing import Any
 
 import yaml
 
-from kimi_linear_gdn2 import KimiLinearConfig
+from kimi_k3_gdn2 import KimiLinearConfig
 
 
 # --------------------------------------------------------------------------- #

@@ -2,7 +2,7 @@
 LatentMoE channel mixer (arXiv:2601.18089) — routed experts in a shared low-rank
 latent space. This is the MoE design Kimi K3's "Stable LatentMoE" builds on (and
 the one adopted by NVIDIA's Nemotron-3 Super/Ultra). In this K3 recreation it is
-the REQUIRED channel mixer: every DecoderLayer uses it (kimi_linear_gdn2.py).
+the REQUIRED channel mixer: every DecoderLayer uses it (kimi_k3_gdn2.py).
 The "Stable" additions and Quantile Balancing K3 layers on top are not yet
 recreated — they await the K3 technical report.
 
