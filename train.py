@@ -17,6 +17,13 @@ needs no data-iterator state: Orbax restores (model, optimizer) and training
 continues at latest_step + 1 reading `train_ds[step]` — bit-identical to a run
 that never stopped.
 
+MULTI-GPU (e.g. Kaggle's 2x T4): plain DATA PARALLELISM via GSPMD — parameters
+are replicated across all local devices and each global batch is split along
+its batch axis (`setup_data_parallel`); the jitted step then runs partitioned
+automatically, with XLA inserting the gradient all-reduce. batch_size is the
+GLOBAL batch and must be divisible by jax.device_count(). On one device this
+degenerates to a trivial 1-device mesh (a no-op).
+
 CHECKPOINT LAYOUT (Orbax CheckpointManager, StandardSave)
 ---------------------------------------------------------
     <ckpt_dir>/<step>/state/   nnx.to_pure_dict of nnx.state((model, optimizer))
@@ -44,6 +51,7 @@ import jax
 import jax.numpy as jnp
 import optax
 import orbax.checkpoint as ocp
+from jax.sharding import NamedSharding, PartitionSpec
 
 from codeparrot_data import load_meta, train_dataset, val_dataset
 from kimi_k3_gdn2 import KimiK3, KimiK3Config, count_params
@@ -120,6 +128,26 @@ def build_optimizer(model: KimiK3, tc: TrainConfig) -> nnx.Optimizer:
 
 
 # --------------------------------------------------------------------------- #
+#  Data parallelism (GSPMD): replicate params, shard the batch axis
+# --------------------------------------------------------------------------- #
+def setup_data_parallel(model, optimizer) -> NamedSharding:
+    """Replicate (model, optimizer) across all local devices; return the batch
+    sharding. GSPMD then partitions the jitted train/eval steps automatically:
+    each device computes its batch shard, XLA all-reduces the gradients. With
+    one device this is a trivial no-op mesh."""
+    # AxisType.Auto: classic GSPMD propagation. (The default explicit
+    # sharding-in-types mode rejects the embedding gather over sharded token
+    # indices as ambiguous; Auto lets XLA resolve it.)
+    mesh = jax.make_mesh(
+        (jax.device_count(),), ("data",), axis_types=(jax.sharding.AxisType.Auto,)
+    )
+    state = nnx.state((model, optimizer))
+    state = jax.device_put(state, NamedSharding(mesh, PartitionSpec()))
+    nnx.update((model, optimizer), state)
+    return NamedSharding(mesh, PartitionSpec("data"))
+
+
+# --------------------------------------------------------------------------- #
 #  Steps (jitted)
 # --------------------------------------------------------------------------- #
 def _ce(logits: jax.Array, labels: jax.Array) -> jax.Array:
@@ -163,12 +191,18 @@ def eval_step(model: KimiK3, inputs: jax.Array, labels: jax.Array) -> jax.Array:
     return _ce(logits, labels)
 
 
-def evaluate(model: KimiK3, val_ds, n_batches: int) -> float:
-    """Mean CE over the first n_batches of the deterministic val set."""
+def evaluate(
+    model: KimiK3, val_ds, n_batches: int, sharding: NamedSharding | None = None
+) -> float:
+    """Mean CE over the first n_batches of the deterministic val set.
+    `sharding` (from setup_data_parallel) splits eval batches across devices."""
     total, n = 0.0, 0
     for i in range(min(n_batches, len(val_ds))):
         b = val_ds[i]
-        total += float(eval_step(model, jnp.asarray(b["inputs"]), jnp.asarray(b["labels"])))
+        x, y = jnp.asarray(b["inputs"]), jnp.asarray(b["labels"])
+        if sharding is not None:
+            x, y = jax.device_put((x, y), sharding)
+        total += float(eval_step(model, x, y))
         n += 1
     return total / max(n, 1)
 
@@ -230,6 +264,16 @@ def main() -> None:
         restore_ckpt(mngr, mngr.latest_step(), model, optimizer)
         print(f"resumed from checkpoint step {mngr.latest_step()}")
 
+    # Data parallelism (no-op on a single device). AFTER restore, so the
+    # restored state is what gets replicated.
+    n_dev = jax.device_count()
+    assert tc.batch_size % n_dev == 0, (
+        f"batch_size ({tc.batch_size}) must be divisible by device count ({n_dev})"
+    )
+    batch_sharding = setup_data_parallel(model, optimizer)
+    print(f"devices: {n_dev} x {jax.devices()[0].platform.upper()} "
+          f"| per-device batch {tc.batch_size // n_dev}")
+
     # Sidecar metadata so evaluate.py can rebuild the exact model.
     ckpt_dir = pathlib.Path(tc.ckpt_dir)
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -243,11 +287,10 @@ def main() -> None:
     t0, tok0 = time.perf_counter(), 0
     for step in range(start, tc.steps):
         b = train_ds[step]  # Grain: deterministic batch for this global step
-        m = train_step(
-            model, optimizer,
-            jnp.asarray(b["inputs"]), jnp.asarray(b["labels"]),
-            tc.router_bias_lr,
+        inputs, labels = jax.device_put(
+            (jnp.asarray(b["inputs"]), jnp.asarray(b["labels"])), batch_sharding
         )
+        m = train_step(model, optimizer, inputs, labels, tc.router_bias_lr)
         tok0 += tokens_per_step
 
         if step % tc.log_every == 0 or step == tc.steps - 1:
@@ -259,14 +302,14 @@ def main() -> None:
             t0, tok0 = time.perf_counter(), 0
 
         if tc.eval_every and step and step % tc.eval_every == 0:
-            vce = evaluate(model, val_ds, tc.eval_batches)
+            vce = evaluate(model, val_ds, tc.eval_batches, batch_sharding)
             print(f"step {step:6d} | VAL ce {vce:.4f} | VAL ppl {jnp.exp(vce):.1f}")
 
         if step % tc.ckpt_every == 0 or step == tc.steps - 1:
             save_ckpt(mngr, step, model, optimizer, force=step == tc.steps - 1)
 
     mngr.wait_until_finished()
-    vce = evaluate(model, val_ds, tc.eval_batches)
+    vce = evaluate(model, val_ds, tc.eval_batches, batch_sharding)
     print(f"final | VAL ce {vce:.4f} | VAL ppl {jnp.exp(vce):.1f}")
     print(f"checkpoints in {ckpt_dir.absolute()}")
 
