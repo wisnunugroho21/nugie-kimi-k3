@@ -269,14 +269,15 @@ def make_ckpt_manager(ckpt_dir: str, tc: TrainConfig) -> ocp.CheckpointManager:
     )
 
 
-def save_ckpt(mngr, step: int, model, optimizer, *, force: bool = False) -> None:
+def save_ckpt(mngr: ocp.CheckpointManager, step: int, model, optimizer, *, force: bool = False) -> None:
     """force=True bypasses save_interval_steps — used for the final step, which
     otherwise gets skipped whenever (steps-1) isn't a multiple of ckpt_every."""
     state = nnx.state((model, optimizer))
     mngr.save(step, args=ocp.args.StandardSave(nnx.to_pure_dict(state)), force=force)
+    mngr.wait_until_finished()
 
 
-def restore_ckpt(mngr, step: int, model, optimizer) -> None:
+def restore_ckpt(mngr: ocp.CheckpointManager, step: int, model, optimizer) -> None:
     """Restore IN PLACE into freshly built (model, optimizer)."""
     state = nnx.state((model, optimizer))
     pure = mngr.restore(step, args=ocp.args.StandardRestore(nnx.to_pure_dict(state)))
