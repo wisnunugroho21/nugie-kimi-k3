@@ -18,7 +18,7 @@ model:
   gdn_head_v_dim: 64
   gdn_chunk_size: 64
   gdn_conv_size: 4
-  gdn_core: subchunking
+  gdn_core: pairwise
   gdn_expanded_erase: False
   mla_num_q_heads: 8
   mla_num_kv_heads: 2

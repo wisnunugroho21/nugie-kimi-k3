@@ -143,7 +143,7 @@ class KimiK3Config:
     #   multiple of this C (it reshapes L into L/C chunks). Keep seq_len % C == 0.
     gdn_conv_size: int = 4  # short-conv kernel width
     gdn_expanded_erase: bool = True  # erase gate in [0,2] (neg-eigenvalue variant)
-    gdn_core: str = "centered"  # which GDN-2 chunkwise core computes each head (paper: "faithful")
+    gdn_core: str = "pairwise"  # which GDN-2 chunkwise core computes each head (paper: "faithful")
 
     # --- MLA full-attention layers (NoPE) — see multi_latent_attention/attention.py ---
     mla_num_q_heads: int = 8  # query heads
