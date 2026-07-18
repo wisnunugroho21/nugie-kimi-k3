@@ -46,7 +46,10 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
+import os
 import pathlib
+import shutil
+import subprocess
 import time
 
 import flax.nnx as nnx
@@ -174,6 +177,31 @@ def build_optimizer(model: KimiK3, tc: TrainConfig) -> nnx.Optimizer:
         ),
     )
     return nnx.Optimizer(model, tx, wrt=nnx.Param)
+
+
+def gpu_utilization() -> str:
+    """Per-GPU utilization/memory sampled from nvidia-smi, for the step log.
+
+    This is the ground truth for "is the second GPU actually computing":
+    utilization.gpu is the fraction of the last sample window in which a kernel
+    was executing on that device. Returns '' on machines without nvidia-smi.
+    Under healthy data parallelism every GPU shows similar, nonzero numbers.
+    """
+    if shutil.which("nvidia-smi") is None:
+        return ""
+    try:
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=index,utilization.gpu,memory.used",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5,
+        ).stdout
+        parts = []
+        for line in out.strip().splitlines():
+            idx, util, mem = (x.strip() for x in line.split(","))
+            parts.append(f"{idx}:{util}%/{int(mem):,}MiB")
+        return " | gpu " + " ".join(parts) if parts else ""
+    except Exception:
+        return ""
 
 
 # --------------------------------------------------------------------------- #
@@ -322,7 +350,9 @@ def main() -> None:
     )
     batch_sharding = setup_data_parallel(model, optimizer)
     print(f"devices: {n_dev} x {jax.devices()[0].platform.upper()} "
-          f"| per-device batch {tc.batch_size // n_dev}")
+          f"| per-device batch {tc.batch_size // n_dev} "
+          f"| jax {jax.__version__} "
+          f"| CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')}")
     for d in jax.devices():
         print(f"  {d.id}: {d.device_kind}")
     if n_dev == 1 and jax.devices()[0].platform == "gpu":
@@ -367,11 +397,13 @@ def main() -> None:
                           f"{stats['bytes_in_use'] / 2**20:,.0f} MiB")
 
         if step % tc.log_every == 0 or step == tc.steps - 1:
+            # NOTE: float(...) blocks on the step, so the utilization sampled
+            # right after reflects the steady-state training just executed.
             dt = time.perf_counter() - t0
             ce = float(m["ce"])
             print(f"step {step:6d} | loss {float(m['loss']):.4f} | ce {ce:.4f} "
                   f"| ppl {jnp.exp(ce):.1f} | aux {float(m['aux_loss']):.4f} "
-                  f"| {tok0 / max(dt, 1e-9):,.0f} tok/s")
+                  f"| {tok0 / max(dt, 1e-9):,.0f} tok/s{gpu_utilization()}")
             t0, tok0 = time.perf_counter(), 0
 
         if tc.eval_every and step and step % tc.eval_every == 0:
