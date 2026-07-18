@@ -6,8 +6,11 @@ WHAT ONE TRAINING STEP DOES
 ---------------------------
     batch = train_ds[step]                       # Grain: pure function of (seed, step)
     loss  = CE(logits, labels) + Σ_layers aux_loss   # MoE Switch-style aux loss
-    grads -> optax.adamw (warmup-cosine LR, global-norm clip, weight decay
-             masked to >=2-D params: norms/biases/decays/pseudo-queries exempt)
+    grads -> Muon + AdamW (optax.contrib.muon; warmup-cosine LR, global-norm
+             clip): Newton-Schulz-orthogonalized momentum for the MATRIX
+             parameters — per-expert for the stacked MoE weights — and AdamW
+             for embeddings/LM head/1-D params, the Moonlight / Kimi K2 recipe
+             (see build_optimizer)
     router_bias[e] += lr_bias * sign(fair_share - load[e])   # per MoE layer,
              OUTSIDE the gradient: DeepSeek-V3 aux-loss-free load balancing
              (see multi_latent_attention/moe.py::update_router_bias)
@@ -50,8 +53,10 @@ import flax.nnx as nnx
 import jax
 import jax.numpy as jnp
 import optax
+import optax.contrib
 import orbax.checkpoint as ocp
 from jax.sharding import NamedSharding, PartitionSpec
+from optax.contrib import MuonDimensionNumbers
 
 from codeparrot_data import load_meta, train_dataset, val_dataset
 from kimi_k3_gdn2 import KimiK3, KimiK3Config, count_params
@@ -68,13 +73,15 @@ class TrainConfig:
     seq_len: int = 256  # must be a multiple of the GDN-2 chunk size (64)
     batch_size: int = 8
     steps: int = 2000
-    # Optax schedule/optimizer
+    # Optax schedule/optimizer (Muon + AdamW; one lr serves both — see
+    # build_optimizer's consistent-RMS note)
     lr: float = 3e-4
     warmup_steps: int = 100
     min_lr_frac: float = 0.1  # cosine floor = lr * min_lr_frac
-    weight_decay: float = 0.1
+    weight_decay: float = 0.1  # on the Muon (matrix) side; AdamW side undecayed
     grad_clip: float = 1.0
-    b1: float = 0.9
+    muon_beta: float = 0.95  # Muon momentum decay
+    b1: float = 0.9  # AdamW side (embeddings / LM head / 1-D params)
     b2: float = 0.95
     # MoE router-bias balancing (outside the gradient)
     router_bias_lr: float = 1e-3
@@ -99,13 +106,53 @@ def build_model(vocab_size: int, seq_len: int, seed: int) -> KimiK3:
     return KimiK3(cfg, rngs=nnx.Rngs(seed))
 
 
-def build_optimizer(model: KimiK3, tc: TrainConfig) -> nnx.Optimizer:
-    """AdamW with warmup-cosine schedule and global-norm clipping.
+def _muon_dim_numbers(params):
+    """Per-leaf Muon/AdamW partition for optax.contrib.muon.
 
-    Weight decay is masked to >=2-D parameters: RMSNorm gains, biases, the
-    GDN-2 decay params (A_log/dt_bias), and the AttnRes pseudo-queries are
-    1-D and must not be decayed (the pseudo-queries in particular are
-    zero-initialized — decay would fight their growth from zero).
+    A MuonDimensionNumbers leaf routes the parameter to Muon (declaring which
+    axes form the matrix — every other axis is vmapped as a batch axis);
+    None routes it to the AdamW side. The split follows the Muon/Moonlight
+    recipe, which Kimi K2 scaled up:
+
+      Muon (0, 1):  every plain 2-D kernel — attention/MoE projections,
+                    routers, low-rank factors, shared-expert matrices.
+      Muon (1, 2):  the stacked MoE expert weights [E, in, out] — the expert
+                    axis 0 becomes a batch axis, so each expert's matrix is
+                    orthogonalized INDEPENDENTLY.
+      AdamW:        embeddings and the LM head (2-D, but excluded by the Muon
+                    authors — they are lookup tables, not linear maps), every
+                    1-D parameter (norm gains, biases, A_log/dt_bias, the
+                    zero-initialized AttnRes pseudo-queries), and the [W, 1, C]
+                    depthwise short-conv kernels.
+    """
+    def rule(path, p):
+        name = "/".join(str(getattr(k, "key", k)) for k in path)
+        if "embed" in name or "lm_head" in name:
+            return None
+        if p.ndim == 2:
+            return MuonDimensionNumbers()  # matrix as-is: (reduction 0, output 1)
+        if p.ndim == 3 and "channel_mixer" in name and "conv" not in name:
+            return MuonDimensionNumbers(1, 2)  # [E, in, out]: per-expert
+        return None
+
+    return jax.tree_util.tree_map_with_path(rule, params)
+
+
+def build_optimizer(model: KimiK3, tc: TrainConfig) -> nnx.Optimizer:
+    """Muon + AdamW (the Moonlight / Kimi K2 optimizer recipe) with a
+    warmup-cosine schedule and global-norm clipping.
+
+    Muon orthogonalizes each matrix parameter's momentum with a Newton-Schulz
+    iteration; non-matrix parameters fall through to AdamW (partition in
+    `_muon_dim_numbers`). consistent_rms=0.2 applies Moonlight's update-RMS
+    matching (arXiv:2502.16982): Muon updates are rescaled by
+    0.2·sqrt(max(fan_in, fan_out)) so they land at AdamW-like RMS — which is
+    what lets ONE learning rate (and schedule) drive both partitions.
+
+    Weight decay: applied on the Muon side (all matrices). The AdamW side is
+    left undecayed — it holds exactly the parameters the previous AdamW-only
+    setup masked out of decay, plus the embeddings/LM head (which the Muon
+    reference setup also leaves undecayed).
     """
     schedule = optax.warmup_cosine_decay_schedule(
         init_value=0.0,
@@ -116,12 +163,14 @@ def build_optimizer(model: KimiK3, tc: TrainConfig) -> nnx.Optimizer:
     )
     tx = optax.chain(
         optax.clip_by_global_norm(tc.grad_clip),
-        optax.adamw(
-            schedule,
-            b1=tc.b1,
-            b2=tc.b2,
+        optax.contrib.muon(
+            learning_rate=schedule,
+            beta=tc.muon_beta,
             weight_decay=tc.weight_decay,
-            mask=lambda params: jax.tree.map(lambda p: jnp.ndim(p) >= 2, params),
+            consistent_rms=0.2,  # Moonlight RMS matching -> shared lr
+            adam_b1=tc.b1,
+            adam_b2=tc.b2,
+            muon_weight_dimension_numbers=_muon_dim_numbers,
         ),
     )
     return nnx.Optimizer(model, tx, wrt=nnx.Param)
