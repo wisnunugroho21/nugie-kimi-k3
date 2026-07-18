@@ -1,0 +1,66 @@
+# Single NVIDIA H200 (141 GB, Hopper).
+#
+# Full bf16 with native tensor-core acceleration and fp32 master weights. This is a
+# real ~2.4B-param sparse-MoE run — the H200's memory lets the model, the fp32 Adam
+# state, and long-sequence activations all sit resident.
+#
+# TUNING KNOBS (the H200 has headroom to push all of these):
+#   - seq_len / batch_size: the MLA full-attention layers are O(L^2) in memory
+#     (~batch * heads * L^2). If you raise seq_len toward max_seq_len (2048), drop
+#     batch_size to compensate, or you may OOM in the attention matrix.
+#   - moe_n_routed / moe_d_ff / n_layers: scale toward the paper's numbers for a
+#     bigger model.
+#
+#   python -m pipeline.prepare_data --config configs/h200.yaml
+#   python -m pipeline.train        --config configs/h200.yaml
+
+model:
+  vocab_size: 32768
+  d_model: 1024
+  n_layers: 24 # MLA at indices 3,7,11,15,19,23 (3:1 hybrid)
+  full_attn_period: 4
+  gdn_num_heads: 16
+  gdn_head_k_dim: 128
+  gdn_head_v_dim: 128
+  gdn_chunk_size: 64
+  gdn_conv_size: 4
+  mla_num_q_heads: 16
+  mla_num_kv_heads: 2
+  mla_head_dim: 128
+  max_seq_len: 2048
+  moe_d_ff: 1024
+  moe_n_routed: 32
+  moe_n_shared: 2
+  moe_top_k: 4
+  compute_dtype: bfloat16
+
+data:
+  data_dir: data/codeparrot
+  source: huggingface
+  hf_dataset: codeparrot/codeparrot-train-v2-near-dedup
+  text_field: content
+  num_train_docs: 500000 # pull much more of the corpus for a serious run
+  num_val_docs: 2000
+  tokenizer: codeparrot
+  tokenizer_name: codeparrot/codeparrot
+  seq_len: 1024 # multiple of gdn_chunk_size (64), <= max_seq_len
+  num_workers: 8
+
+train:
+  batch_size: 32
+  max_steps: 200000
+  lr: 0.0003
+  min_lr: 0.00003
+  warmup_steps: 2000
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.95
+  grad_clip: 1.0
+  router_bias_lr: 0.001
+  ckpt_dir: checkpoints/h200
+  save_every: 5000
+  keep_checkpoints: 3
+  log_every: 50
+  eval_every: 5000
+  eval_steps: 200
+  seed: 0

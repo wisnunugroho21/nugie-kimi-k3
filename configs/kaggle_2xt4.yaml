@@ -1,0 +1,68 @@
+# 2x NVIDIA T4 (2 x 16 GB) — Kaggle.
+#
+# Same model as the single-T4 Colab config, trained with DATA PARALLELISM: train.py
+# auto-detects both GPUs, replicates params/optimizer state on each, and shards every
+# batch across them. Per-GPU memory is therefore the SAME as one T4 — the second GPU
+# buys THROUGHPUT (2x the tokens/step), not a bigger model. To grow the model you are
+# still bounded by a single 16 GB card.
+#
+# batch_size MUST be divisible by the device count (2). Here 16 -> 8 examples/GPU,
+# matching the single-T4 per-device batch.
+#
+# Precision bfloat16 — same T4 caveat as colab_t4.yaml (no bf16 tensor cores; memory
+# win only). Use float32 for extra stability.
+#
+#   python -m pipeline.prepare_data --config configs/kaggle_2xt4.yaml
+#   python -m pipeline.train        --config configs/kaggle_2xt4.yaml
+#     -> log line "Data-parallel over 2 devices (8 examples/device)."
+
+model:
+  vocab_size: 32768
+  d_model: 512
+  n_layers: 10 # MLA at indices 3, 7 (3:1 hybrid)
+  full_attn_period: 4
+  gdn_num_heads: 8
+  gdn_head_k_dim: 64
+  gdn_head_v_dim: 64
+  gdn_chunk_size: 64
+  gdn_conv_size: 4
+  mla_num_q_heads: 8
+  mla_num_kv_heads: 2
+  mla_head_dim: 64
+  max_seq_len: 1024
+  moe_d_ff: 1024
+  moe_n_routed: 8
+  moe_n_shared: 1
+  moe_top_k: 2
+  compute_dtype: bfloat16
+
+data:
+  data_dir: data/codeparrot
+  source: huggingface
+  hf_dataset: codeparrot/codeparrot-train-v2-near-dedup
+  text_field: content
+  num_train_docs: 100000
+  num_val_docs: 1000
+  tokenizer: codeparrot
+  tokenizer_name: codeparrot/codeparrot
+  seq_len: 512
+  num_workers: 4 # Kaggle exposes ~4 CPU cores
+
+train:
+  batch_size: 16 # 8 per GPU across the 2 T4s (must be divisible by 2)
+  max_steps: 40000
+  lr: 0.0004 # slightly higher LR for the 2x-larger global batch
+  min_lr: 0.00004
+  warmup_steps: 1000
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.95
+  grad_clip: 1.0
+  router_bias_lr: 0.001
+  ckpt_dir: checkpoints/kaggle_2xt4
+  save_every: 25
+  keep_checkpoints: 2
+  log_every: 25
+  eval_every: 2000
+  eval_steps: 100
+  seed: 0

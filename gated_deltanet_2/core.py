@@ -926,18 +926,18 @@ def chunkwise_gated_delta_rule_2(
       q, k, g, b: [B, H, L, dk]   v, w: [B, H, L, dv]   S0: [B, H, dk, dv]
       chunk_size: intra-chunk length C (L must be divisible by C).
       core: which chunkwise core computes each head —
-        "centered"     (default) exponent-centered matmuls; safe for
-                       per-chunk cumulative log-decay |G_C| up to ≈ 176.
-        "subchunking"  GLA-style secondary chunking; NO decay-range limit,
-                       matmul-dominated; tuned by sub_chunk_size.
-        "pairwise"     per-triple log-space decay; NO range limit but ×C
-                       memory on the score path — verification / fallback.
-        "stacked_rhs"  the paper's literal factors + stacked-RHS solver;
-                       overflows past |G_C| ≈ 88 — reference.
-        "faithful"     the paper's equations verbatim (explicit inverse);
-                       overflows past |G_C| ≈ 88 — reference.
-      sub_chunk_size: c for core="subchunking" (must divide chunk_size);
-                      ignored by every other core.
+        "faithful"      the paper's equations verbatim (explicit inverse);
+                        overflows past |G_C| ≈ 88 — reference.
+        "stacked_rhs"   the paper's literal factors + stacked-RHS solver;
+                        overflows past |G_C| ≈ 88 — reference.
+        "centered"      (default) exponent-centered matmuls; safe for
+                        per-chunk cumulative log-decay |G_C| up to ≈ 176.
+        "subchunking"   GLA-style secondary chunking; NO decay-range limit,
+                        matmul-dominated; tuned by sub_chunk_size.
+        "pairwise"      per-triple log-space decay; NO range limit but ×C
+                        memory on the score path — verification / fallback.
+      sub_chunk_size:   c for core="subchunking" (must divide chunk_size);
+                        ignored by every other core.
     Returns:
       (O: [B, H, L, dv], S_final: [B, H, dk, dv])
     """
