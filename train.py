@@ -20,12 +20,15 @@ needs no data-iterator state: Orbax restores (model, optimizer) and training
 continues at latest_step + 1 reading `train_ds[step]` — bit-identical to a run
 that never stopped.
 
-MULTI-GPU (e.g. Kaggle's 2x T4): plain DATA PARALLELISM via GSPMD — parameters
-are replicated across all local devices and each global batch is split along
-its batch axis (`setup_data_parallel`); the jitted step then runs partitioned
-automatically, with XLA inserting the gradient all-reduce. batch_size is the
-GLOBAL batch and must be divisible by jax.device_count(). On one device this
-degenerates to a trivial 1-device mesh (a no-op).
+MULTI-GPU (e.g. Kaggle's 2x T4): PURE GSPMD DATA PARALLELISM. One 1-D "data"
+mesh spans every visible device; the full (model, optimizer) state is
+device_put fully REPLICATED (PartitionSpec()) and each global batch is sharded
+along its batch axis (PartitionSpec("data")). The sharding contract is
+expressed twice — on the host via device_put and INSIDE the jitted steps via
+jax.lax.with_sharding_constraint — so the compiled executable is partitioned
+by construction; XLA emits the per-device programs and the gradient
+all-reduce. batch_size is the GLOBAL batch and must be divisible by
+jax.device_count(). On one device everything degenerates to a no-op mesh.
 
 CHECKPOINT LAYOUT (Orbax CheckpointManager, StandardSave)
 ---------------------------------------------------------
@@ -205,23 +208,57 @@ def gpu_utilization() -> str:
 
 
 # --------------------------------------------------------------------------- #
-#  Data parallelism (GSPMD): replicate params, shard the batch axis
+#  Pure GSPMD data parallelism: shard the batch, replicate params + optimizer
 # --------------------------------------------------------------------------- #
+# The batch sharding chosen by setup_data_parallel. It is applied in TWO
+# places, both of which express the SAME contract to XLA:
+#   1. `jax.device_put(batch, _BATCH_SHARDING)` in the host loop — places each
+#      batch's rows on their devices before the step runs;
+#   2. `_constrain_batch` INSIDE the jitted steps — a
+#      jax.lax.with_sharding_constraint baked into the traced program, so the
+#      compiled executable is data-parallel BY CONSTRUCTION, not merely by
+#      inference from how the arguments happened to be placed.
+# None until setup_data_parallel runs (e.g. evaluate.py's single-device use):
+# the in-step constraint is then a no-op. Set it BEFORE the first train_step /
+# eval_step call — nnx.jit traces once and caches.
+_BATCH_SHARDING: NamedSharding | None = None
+
+
 def setup_data_parallel(model, optimizer) -> NamedSharding:
-    """Replicate (model, optimizer) across all local devices; return the batch
-    sharding. GSPMD then partitions the jitted train/eval steps automatically:
-    each device computes its batch shard, XLA all-reduces the gradients. With
-    one device this is a trivial no-op mesh."""
+    """Pure GSPMD data parallelism across ALL visible devices.
+
+    * One 1-D "data" mesh spanning every device JAX enumerates.
+    * The ENTIRE (model, optimizer) state — parameters, optimizer moments,
+      router biases — is device_put with PartitionSpec(): fully REPLICATED,
+      one full copy per device.
+    * Batches are sharded along axis 0 with PartitionSpec("data").
+
+    XLA's SPMD partitioner then emits one identical program per device: each
+    device computes forward/backward on its batch shard against its parameter
+    replica, gradients meet in an all-reduce, and every replica applies the
+    same update (replication is preserved without any explicit sync). With one
+    device the mesh is trivial and everything degenerates to the no-op.
+    """
+    global _BATCH_SHARDING
     # AxisType.Auto: classic GSPMD propagation. (The default explicit
     # sharding-in-types mode rejects the embedding gather over sharded token
     # indices as ambiguous; Auto lets XLA resolve it.)
     mesh = jax.make_mesh(
         (jax.device_count(),), ("data",), axis_types=(jax.sharding.AxisType.Auto,)
     )
-    state = nnx.state((model, optimizer))
-    state = jax.device_put(state, NamedSharding(mesh, PartitionSpec()))
-    nnx.update((model, optimizer), state)
-    return NamedSharding(mesh, PartitionSpec("data"))
+    replicated = NamedSharding(mesh, PartitionSpec())  # same full copy everywhere
+    state = nnx.state((model, optimizer))  # params + opt moments + Variables
+    nnx.update((model, optimizer), jax.device_put(state, replicated))
+    _BATCH_SHARDING = NamedSharding(mesh, PartitionSpec("data"))
+    return _BATCH_SHARDING
+
+
+def _constrain_batch(x: jax.Array) -> jax.Array:
+    """In-program half of the data-parallel contract: force the batch axis
+    sharding inside the jitted step (no-op before setup_data_parallel)."""
+    if _BATCH_SHARDING is None:
+        return x
+    return jax.lax.with_sharding_constraint(x, _BATCH_SHARDING)
 
 
 # --------------------------------------------------------------------------- #
@@ -241,6 +278,9 @@ def train_step(
     router_bias_lr: float,
 ) -> dict[str, jax.Array]:
     """One optimization step; mutates model + optimizer in place (nnx)."""
+    # Bake the data-parallel batch sharding into the traced program.
+    inputs = _constrain_batch(inputs)
+    labels = _constrain_batch(labels)
 
     def loss_fn(model: KimiK3):
         logits, aux = model(inputs)
@@ -264,6 +304,8 @@ def train_step(
 @nnx.jit
 def eval_step(model: KimiK3, inputs: jax.Array, labels: jax.Array) -> jax.Array:
     """Cross-entropy on one batch (no aux loss — it's a training regularizer)."""
+    inputs = _constrain_batch(inputs)  # same data-parallel contract as training
+    labels = _constrain_batch(labels)
     logits, _ = model(inputs)
     return _ce(logits, labels)
 
