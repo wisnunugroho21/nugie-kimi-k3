@@ -20,15 +20,8 @@ needs no data-iterator state: Orbax restores (model, optimizer) and training
 continues at latest_step + 1 reading `train_ds[step]` — bit-identical to a run
 that never stopped.
 
-MULTI-GPU (e.g. Kaggle's 2x T4): PURE GSPMD DATA PARALLELISM. One 1-D "data"
-mesh spans every visible device; the full (model, optimizer) state is
-device_put fully REPLICATED (PartitionSpec()) and each global batch is sharded
-along its batch axis (PartitionSpec("data")). The sharding contract is
-expressed twice — on the host via device_put and INSIDE the jitted steps via
-jax.lax.with_sharding_constraint — so the compiled executable is partitioned
-by construction; XLA emits the per-device programs and the gradient
-all-reduce. batch_size is the GLOBAL batch and must be divisible by
-jax.device_count(). On one device everything degenerates to a no-op mesh.
+SINGLE-DEVICE by design: the trainer runs on JAX's default device (one GPU, or
+CPU). There is no multi-GPU / sharding machinery in this project.
 
 CHECKPOINT LAYOUT (Orbax CheckpointManager, StandardSave)
 ---------------------------------------------------------
@@ -49,7 +42,6 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
-import os
 import pathlib
 import shutil
 import subprocess
@@ -61,7 +53,6 @@ import jax.numpy as jnp
 import optax
 import optax.contrib
 import orbax.checkpoint as ocp
-from jax.sharding import NamedSharding, PartitionSpec
 from optax.contrib import MuonDimensionNumbers
 
 from codeparrot_data import load_meta, train_dataset, val_dataset
@@ -183,12 +174,11 @@ def build_optimizer(model: KimiK3, tc: TrainConfig) -> nnx.Optimizer:
 
 
 def gpu_utilization() -> str:
-    """Per-GPU utilization/memory sampled from nvidia-smi, for the step log.
+    """GPU utilization/memory sampled from nvidia-smi, for the step log.
 
-    This is the ground truth for "is the second GPU actually computing":
     utilization.gpu is the fraction of the last sample window in which a kernel
-    was executing on that device. Returns '' on machines without nvidia-smi.
-    Under healthy data parallelism every GPU shows similar, nonzero numbers.
+    was executing on the device — a quick in-log health check on hosted GPUs
+    (Colab/Kaggle). Returns '' on machines without nvidia-smi.
     """
     if shutil.which("nvidia-smi") is None:
         return ""
@@ -208,60 +198,6 @@ def gpu_utilization() -> str:
 
 
 # --------------------------------------------------------------------------- #
-#  Pure GSPMD data parallelism: shard the batch, replicate params + optimizer
-# --------------------------------------------------------------------------- #
-# The batch sharding chosen by setup_data_parallel. It is applied in TWO
-# places, both of which express the SAME contract to XLA:
-#   1. `jax.device_put(batch, _BATCH_SHARDING)` in the host loop — places each
-#      batch's rows on their devices before the step runs;
-#   2. `_constrain_batch` INSIDE the jitted steps — a
-#      jax.lax.with_sharding_constraint baked into the traced program, so the
-#      compiled executable is data-parallel BY CONSTRUCTION, not merely by
-#      inference from how the arguments happened to be placed.
-# None until setup_data_parallel runs (e.g. evaluate.py's single-device use):
-# the in-step constraint is then a no-op. Set it BEFORE the first train_step /
-# eval_step call — nnx.jit traces once and caches.
-_BATCH_SHARDING: NamedSharding | None = None
-
-
-def setup_data_parallel(model, optimizer) -> NamedSharding:
-    """Pure GSPMD data parallelism across ALL visible devices.
-
-    * One 1-D "data" mesh spanning every device JAX enumerates.
-    * The ENTIRE (model, optimizer) state — parameters, optimizer moments,
-      router biases — is device_put with PartitionSpec(): fully REPLICATED,
-      one full copy per device.
-    * Batches are sharded along axis 0 with PartitionSpec("data").
-
-    XLA's SPMD partitioner then emits one identical program per device: each
-    device computes forward/backward on its batch shard against its parameter
-    replica, gradients meet in an all-reduce, and every replica applies the
-    same update (replication is preserved without any explicit sync). With one
-    device the mesh is trivial and everything degenerates to the no-op.
-    """
-    global _BATCH_SHARDING
-    # AxisType.Auto: classic GSPMD propagation. (The default explicit
-    # sharding-in-types mode rejects the embedding gather over sharded token
-    # indices as ambiguous; Auto lets XLA resolve it.)
-    mesh = jax.make_mesh(
-        (jax.device_count(),), ("data",), axis_types=(jax.sharding.AxisType.Auto,)
-    )
-    replicated = NamedSharding(mesh, PartitionSpec())  # same full copy everywhere
-    state = nnx.state((model, optimizer))  # params + opt moments + Variables
-    nnx.update((model, optimizer), jax.device_put(state, replicated))
-    _BATCH_SHARDING = NamedSharding(mesh, PartitionSpec("data"))
-    return _BATCH_SHARDING
-
-
-def _constrain_batch(x: jax.Array) -> jax.Array:
-    """In-program half of the data-parallel contract: force the batch axis
-    sharding inside the jitted step (no-op before setup_data_parallel)."""
-    if _BATCH_SHARDING is None:
-        return x
-    return jax.lax.with_sharding_constraint(x, _BATCH_SHARDING)
-
-
-# --------------------------------------------------------------------------- #
 #  Steps (jitted)
 # --------------------------------------------------------------------------- #
 def _ce(logits: jax.Array, labels: jax.Array) -> jax.Array:
@@ -278,9 +214,6 @@ def train_step(
     router_bias_lr: float,
 ) -> dict[str, jax.Array]:
     """One optimization step; mutates model + optimizer in place (nnx)."""
-    # Bake the data-parallel batch sharding into the traced program.
-    inputs = _constrain_batch(inputs)
-    labels = _constrain_batch(labels)
 
     def loss_fn(model: KimiK3):
         logits, aux = model(inputs)
@@ -304,24 +237,18 @@ def train_step(
 @nnx.jit
 def eval_step(model: KimiK3, inputs: jax.Array, labels: jax.Array) -> jax.Array:
     """Cross-entropy on one batch (no aux loss — it's a training regularizer)."""
-    inputs = _constrain_batch(inputs)  # same data-parallel contract as training
-    labels = _constrain_batch(labels)
     logits, _ = model(inputs)
     return _ce(logits, labels)
 
 
-def evaluate(
-    model: KimiK3, val_ds, n_batches: int, sharding: NamedSharding | None = None
-) -> float:
-    """Mean CE over the first n_batches of the deterministic val set.
-    `sharding` (from setup_data_parallel) splits eval batches across devices."""
+def evaluate(model: KimiK3, val_ds, n_batches: int) -> float:
+    """Mean CE over the first n_batches of the deterministic val set."""
     total, n = 0.0, 0
     for i in range(min(n_batches, len(val_ds))):
         b = val_ds[i]
-        x, y = jnp.asarray(b["inputs"]), jnp.asarray(b["labels"])
-        if sharding is not None:
-            x, y = jax.device_put((x, y), sharding)
-        total += float(eval_step(model, x, y))
+        total += float(
+            eval_step(model, jnp.asarray(b["inputs"]), jnp.asarray(b["labels"]))
+        )
         n += 1
     return total / max(n, 1)
 
@@ -384,27 +311,8 @@ def main() -> None:
         restore_ckpt(mngr, mngr.latest_step(), model, optimizer)
         print(f"resumed from checkpoint step {mngr.latest_step()}")
 
-    # Data parallelism (no-op on a single device). AFTER restore, so the
-    # restored state is what gets replicated.
-    n_dev = jax.device_count()
-    assert tc.batch_size % n_dev == 0, (
-        f"batch_size ({tc.batch_size}) must be divisible by device count ({n_dev})"
-    )
-    batch_sharding = setup_data_parallel(model, optimizer)
-    print(f"devices: {n_dev} x {jax.devices()[0].platform.upper()} "
-          f"| per-device batch {tc.batch_size // n_dev} "
-          f"| jax {jax.__version__} "
-          f"| CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '<unset>')}")
-    for d in jax.devices():
-        print(f"  {d.id}: {d.device_kind}")
-    if n_dev == 1 and jax.devices()[0].platform == "gpu":
-        # The common multi-GPU failure mode is silent: JAX enumerates ONE CUDA
-        # device (stale CUDA_VISIBLE_DEVICES, broken jax[cuda12] install, ...)
-        # and trains happily on it, while other monitors still show memory
-        # reserved on every physical GPU. Say so explicitly.
-        print("WARNING: JAX sees only ONE GPU. If this machine has more "
-              "(e.g. Kaggle T4 x2), check CUDA_VISIBLE_DEVICES and the "
-              "jax[cuda12] install — training will use just this device.")
+    d = jax.devices()[0]  # single-device training: JAX's default device
+    print(f"device: {d.platform.upper()} ({d.device_kind}) | jax {jax.__version__}")
 
     # Sidecar metadata so evaluate.py can rebuild the exact model.
     ckpt_dir = pathlib.Path(tc.ckpt_dir)
@@ -419,24 +327,12 @@ def main() -> None:
     t0, tok0 = time.perf_counter(), 0
     for step in range(start, tc.steps):
         b = train_ds[step]  # Grain: deterministic batch for this global step
-        inputs, labels = jax.device_put(
-            (jnp.asarray(b["inputs"]), jnp.asarray(b["labels"])), batch_sharding
+        m = train_step(
+            model, optimizer,
+            jnp.asarray(b["inputs"]), jnp.asarray(b["labels"]),
+            tc.router_bias_lr,
         )
-        m = train_step(model, optimizer, inputs, labels, tc.router_bias_lr)
         tok0 += tokens_per_step
-
-        if step == start:
-            # One-time proof of where the work actually lives: the batch shard
-            # placement and each device's live memory. Under data parallelism
-            # every device must appear below with a similar bytes-in-use.
-            devs = sorted({d.id for d in inputs.sharding.device_set})
-            print(f"batch sharded over devices {devs} "
-                  f"({inputs.sharding.shard_shape(inputs.shape)[0]} rows each)")
-            for d in jax.local_devices():
-                stats = d.memory_stats() or {}
-                if "bytes_in_use" in stats:
-                    print(f"  device {d.id} in use: "
-                          f"{stats['bytes_in_use'] / 2**20:,.0f} MiB")
 
         if step % tc.log_every == 0 or step == tc.steps - 1:
             # NOTE: float(...) blocks on the step, so the utilization sampled
@@ -449,14 +345,14 @@ def main() -> None:
             t0, tok0 = time.perf_counter(), 0
 
         if tc.eval_every and step and step % tc.eval_every == 0:
-            vce = evaluate(model, val_ds, tc.eval_batches, batch_sharding)
+            vce = evaluate(model, val_ds, tc.eval_batches)
             print(f"step {step:6d} | VAL ce {vce:.4f} | VAL ppl {jnp.exp(vce):.1f}")
 
         if step % tc.ckpt_every == 0 or step == tc.steps - 1:
             save_ckpt(mngr, step, model, optimizer, force=step == tc.steps - 1)
 
     mngr.wait_until_finished()
-    vce = evaluate(model, val_ds, tc.eval_batches, batch_sharding)
+    vce = evaluate(model, val_ds, tc.eval_batches)
     print(f"final | VAL ce {vce:.4f} | VAL ppl {jnp.exp(vce):.1f}")
     print(f"checkpoints in {ckpt_dir.absolute()}")
 
