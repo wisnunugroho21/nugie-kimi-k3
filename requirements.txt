@@ -1,0 +1,12 @@
+# Core JAX stack (install the CUDA build of jax on GPU: pip install -U "jax[cuda12]")
+jax>=0.6
+flax>=0.10
+optax>=0.2.4            # Muon (pipeline/optimizer.py) needs optax.contrib.muon w/ MuonDimensionNumbers + consistent_rms; tested on 0.2.8
+orbax-checkpoint>=0.6
+
+# Data pipeline
+grain>=0.2
+datasets>=2.19          # streams codeparrot/codeparrot-train-v2-near-dedup from the HF Hub
+transformers>=4.40      # the pretrained codeparrot BPE tokenizer
+numpy>=1.26
+pyyaml>=6.0
