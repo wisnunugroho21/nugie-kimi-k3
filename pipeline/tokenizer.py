@@ -5,7 +5,7 @@ Two backends behind one tiny interface (`encode`, `decode`, `vocab_size`, `eos_i
 
   * ByteTokenizer   — raw UTF-8 bytes, vocab 256, no dependencies, no download.
                       Perfect for smoke tests and matches the model's byte-level
-                      default (KimiLinearConfig.vocab_size = 256).
+                      default (KimiK3Config.vocab_size = 256).
   * HFTokenizer     — the pretrained CodeParrot BPE tokenizer (vocab 32768) via
                       `transformers.AutoTokenizer`. This is what you want for real
                       code generation.

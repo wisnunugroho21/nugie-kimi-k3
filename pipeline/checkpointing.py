@@ -4,7 +4,7 @@ Orbax checkpointing for the whole training state.
 WHAT WE CHECKPOINT
     A single Orbax *composite* checkpoint with five named items, saved/restored
     together at each step:
-        model           the KimiLinear array state (params + MoE router_bias + norm
+        model           the KimiK3 array state (params + MoE router_bias + norm
                         scales) from `nnx.state(model)`.
         optimizer       the Optax optimizer state + nnx step counter from
                         `nnx.state(optimizer)`. In this Flax version `nnx.Optimizer`
