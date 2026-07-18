@@ -323,6 +323,16 @@ def main() -> None:
     batch_sharding = setup_data_parallel(model, optimizer)
     print(f"devices: {n_dev} x {jax.devices()[0].platform.upper()} "
           f"| per-device batch {tc.batch_size // n_dev}")
+    for d in jax.devices():
+        print(f"  {d.id}: {d.device_kind}")
+    if n_dev == 1 and jax.devices()[0].platform == "gpu":
+        # The common multi-GPU failure mode is silent: JAX enumerates ONE CUDA
+        # device (stale CUDA_VISIBLE_DEVICES, broken jax[cuda12] install, ...)
+        # and trains happily on it, while other monitors still show memory
+        # reserved on every physical GPU. Say so explicitly.
+        print("WARNING: JAX sees only ONE GPU. If this machine has more "
+              "(e.g. Kaggle T4 x2), check CUDA_VISIBLE_DEVICES and the "
+              "jax[cuda12] install — training will use just this device.")
 
     # Sidecar metadata so evaluate.py can rebuild the exact model.
     ckpt_dir = pathlib.Path(tc.ckpt_dir)
@@ -342,6 +352,19 @@ def main() -> None:
         )
         m = train_step(model, optimizer, inputs, labels, tc.router_bias_lr)
         tok0 += tokens_per_step
+
+        if step == start:
+            # One-time proof of where the work actually lives: the batch shard
+            # placement and each device's live memory. Under data parallelism
+            # every device must appear below with a similar bytes-in-use.
+            devs = sorted({d.id for d in inputs.sharding.device_set})
+            print(f"batch sharded over devices {devs} "
+                  f"({inputs.sharding.shard_shape(inputs.shape)[0]} rows each)")
+            for d in jax.local_devices():
+                stats = d.memory_stats() or {}
+                if "bytes_in_use" in stats:
+                    print(f"  device {d.id} in use: "
+                          f"{stats['bytes_in_use'] / 2**20:,.0f} MiB")
 
         if step % tc.log_every == 0 or step == tc.steps - 1:
             dt = time.perf_counter() - t0
