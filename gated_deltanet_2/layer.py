@@ -4,6 +4,14 @@ Gated DeltaNet-2 token-mixer layer in Flax NNX, ANNOTATED against the paper
 parameterization), with supporting equations 11, 12, 85, 86 and the numerical
 notes in Appendix D.
 
+ROLE IN THIS PROJECT (a Kimi K3 recreation): this layer is the deliberate
+STAND-IN for K3's Kimi Delta Attention (KDA) — the linear-attention token mixer
+on 3 of every 4 layers. KDA and GDN-2 are siblings in the gated-delta-rule
+family with fine-grained channel-wise gating; GDN-2 decouples KDA/GDN's single
+beta into a separate erase gate `b` and write gate `w`. Where this layer's
+parameterization follows Kimi Linear rather than the GDN-2 paper (the sigmoid
+low-rank output gate below), the docstrings say so explicitly.
+
 Block design (Fig. 1 right; Sec. 3.5 "Gated DeltaNet-2 token mixer"):
   q,k = L2norm(SiLU(ShortConv(Linear(x))))      # key-side paths + L2 norm (Sec. 3.5, App. D.2)
   v   =        SiLU(ShortConv(Linear(x)))        # value path (Sec. 3.5; Fig. 1 caption)
@@ -131,7 +139,8 @@ class GatedRMSNorm(nnx.Module):
 
         Sigmoid(W↑g W↓g x) ⊙ RMSNorm(O)
 
-    Two corrections vs the GDN-2 paper block used in your gdn2_layer:
+    Two deliberate deviations from the GDN-2 paper's block, both adopted from
+    Kimi Linear (and kept by K3's KDA):
       (1) sigmoid, not SiLU/swish  — Kimi Linear's ablation found the swish output
           gate (GDN's choice) performs substantially worse than sigmoid, and they
           adopt sigmoid across all experiments including their GDN hybrid baseline.
