@@ -7,7 +7,7 @@
 #   - float16 WOULD use the T4's tensor cores, but this pipeline has no loss scaling,
 #     so fp16 gradients can underflow — not recommended here.
 #
-# ~200M params. If you hit OOM, lower batch_size first, then n_layers / moe_n_routed.
+# ~98M params. If you hit OOM, lower batch_size first, then n_layers / moe_n_routed.
 #
 #   python -m pipeline.prepare_data --config configs/colab_t4.yaml
 #   python -m pipeline.train        --config configs/colab_t4.yaml
@@ -26,6 +26,7 @@ model:
   mla_num_kv_heads: 2
   mla_head_dim: 64
   max_seq_len: 1024
+  moe_d_latent: 128 # expert latent width ℓ = d_model/4 (the LatentMoE paper's α = 4)
   moe_d_ff: 1024
   moe_n_routed: 8
   moe_n_shared: 1

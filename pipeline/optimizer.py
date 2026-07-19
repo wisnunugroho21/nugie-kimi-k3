@@ -68,8 +68,9 @@ def _muon_spec(path, leaf) -> MuonDimensionNumbers | None:
     (with that matrix layout); None => it goes to the AdamW side."""
     names = _path_names(path)
 
-    # Moonlight: embedding + LM head stay on AdamW. A_log is 2D [H, dk] but is a
-    # per-channel decay parameter, not a matmul weight — AdamW as well.
+    # Moonlight: embedding + LM head stay on AdamW. A_log ([H], the per-head
+    # decay base) is listed alongside them for clarity — as a 1-D leaf the
+    # fallback below would route it to AdamW anyway.
     if names & {"embed", "lm_head", "A_log"}:
         return None
 

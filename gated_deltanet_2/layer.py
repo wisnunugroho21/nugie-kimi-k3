@@ -19,7 +19,8 @@ Block design (Fig. 1 right; Sec. 3.5 "Gated DeltaNet-2 token mixer"):
   b   = sigmoid(Linear_b(x))                     # erase gate (Eq. 11 / 85); x2 if neg-eigenvalue
   w   = sigmoid(Linear_w(x))                     # write gate (Eq. 11 / 85)
   O   = chunkwise_gated_delta_rule_2(q,k,v,g,b,w, state)   # Gated Delta Rule-2 (Eq. 10)
-  out = Linear_o( RMSNorm(O) * SiLU(Linear_g(x)) )  # gated RMSNorm + out proj (Sec. 3.5, App. D.5)
+  out = Linear_o( RMSNorm(O) * σ(W↑ W↓ x) )        # gated RMSNorm + out proj — sigmoid
+        # low-rank gate, Kimi Linear's variant of the paper's SiLU gate (see GatedRMSNorm)
 
 Grouped value heads (Sec. 3.5 last sentence / App. C.1): with num_v_heads = G*num_heads,
 the key-side tensors q, k, the log-decay g, and b are shared across the G value heads
@@ -511,7 +512,7 @@ class GatedDeltaNet2(nnx.Module):
         o = o.swapaxes(1, 2).reshape(B, L, self.Hv, self.dv)  # ungroup value heads
         o = self.o_norm(o, x).astype(
             x.dtype
-        )  # SiLU output gate computed inside, from x (Sec. 3.5 / App. D.5)
+        )  # low-rank SIGMOID output gate computed inside, from x (see GatedRMSNorm)
 
         return self.o_proj(o)  # project back to d_model
 

@@ -20,6 +20,7 @@ model:
   mla_num_kv_heads: 2
   mla_head_dim: 32
   max_seq_len: 256
+  moe_d_latent: 64       # ℓ = d_model/2 (α = 2; the paper finds quality preserved for α <= 4)
   moe_d_ff: 256
   moe_n_routed: 8
   moe_n_shared: 1

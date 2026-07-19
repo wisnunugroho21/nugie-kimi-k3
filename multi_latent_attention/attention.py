@@ -250,13 +250,13 @@ class GroupedQueryLatentAttention(nnx.Module):
     #  new positions are written into it.  Use it for prefill (L = prompt length)
     #  and per-token decode (L = 1) alike.
     # ----------------------------------------------------------------------- #
-    def init_cache(self, batch_size: int, max_len: int, dtype=F32) -> MLACache:
+    def init_cache(self, batch_size: int, max_len: int, dtype=None) -> MLACache:
         """Initialize the streaming KV cache for a given batch size and max length.
-        The cache is a preallocated buffer of shape [B, max_len, Hkv*Dh] and a position counter.
-        The buffer is filled with zeros initially."""
+        The cache is a zero-filled preallocated buffer of shape [B, max_len, Hkv*Dh]
+        plus a position counter. dtype defaults to fp32 (None => fp32)."""
         d_kv = self.num_kv_heads * self.head_dim
         return MLACache(
-            l_kv=jnp.zeros((batch_size, max_len, d_kv), dtype),
+            l_kv=jnp.zeros((batch_size, max_len, d_kv), dtype or F32),
             pos=jnp.array(0, jnp.int32),
         )
 

@@ -360,9 +360,11 @@ class DecoderLayer(nnx.Module):
         partial = partial + m
         return blocks, partial, aux
 
-    def init_cache(self, batch_size: int, max_len: int, dtype=jnp.float32):
+    def init_cache(self, batch_size: int, max_len: int, dtype=None):
         """Per-layer streaming cache: a GDN2Cache (linear layer) or MLACache (MLA).
-        AttnRes needs NO cache — it mixes depth, not positions."""
+        dtype=None lets each mixer pick its own default (GDN-2: its compute_dtype
+        for the conv caches; MLA: fp32 latents). AttnRes needs NO cache — it
+        mixes depth, not positions."""
         return self.token_mixer.init_cache(batch_size, max_len, dtype)
 
     def step(
@@ -494,10 +496,13 @@ class KimiK3(nnx.Module):
     #  each new position from that position's own layer outputs.
     # ----------------------------------------------------------------------- #
     def init_cache(
-        self, batch_size: int, max_len: int | None = None, dtype=jnp.float32
+        self, batch_size: int, max_len: int | None = None, dtype=None
     ) -> list:
         """Streaming caches for every layer. `max_len` (default cfg.max_seq_len) sizes
-        the MLA latent buffers; GDN-2 layers ignore it (their state is fixed-size)."""
+        the MLA latent buffers; GDN-2 layers ignore it (their state is fixed-size).
+        `dtype` overrides every cache's buffer dtype; None (default) lets each
+        mixer choose — GDN-2 conv caches in the layer's compute_dtype (avoiding a
+        silent fp32 promotion of the conv path under bf16), MLA latents in fp32."""
         max_len = max_len or self.cfg.max_seq_len
         return [layer.init_cache(batch_size, max_len, dtype) for layer in self.layers]
 
@@ -519,10 +524,29 @@ class KimiK3(nnx.Module):
         return self.lm_head(x).astype(jnp.float32), new_caches
 
     def generate(
-        self, prompt_ids: jax.Array, max_new_tokens: int, max_len: int | None = None
+        self,
+        prompt_ids: jax.Array,
+        max_new_tokens: int,
+        max_len: int | None = None,
+        *,
+        temperature: float = 0.0,
+        top_p: float = 1.0,
+        eos_id: int | None = None,
+        key: jax.Array | None = None,
     ) -> jax.Array:
-        """Greedy autoregressive decode that REUSES each layer's state across steps.
-        prompt_ids: int[B, P]. Returns the continuation int[B, max_new_tokens].
+        """Autoregressive decode that REUSES each layer's state across steps.
+        prompt_ids: int[B, P]. Returns the continuation int[B, n] with
+        n <= max_new_tokens (shorter only when `eos_id` stops every row early).
+
+        Decoding strategy:
+          temperature = 0 (default): greedy argmax.
+          temperature > 0:  sample from softmax(logits / temperature), optionally
+            truncated to the nucleus (top-p) of tokens whose probabilities sum to
+            >= top_p; requires a PRNG `key`. top_p = 1.0 disables the truncation.
+          eos_id: when given, a row that emits it keeps emitting it (padding),
+            and the loop exits once EVERY row has finished. The early-exit check
+            syncs a B-bool mask to the host each token — omit eos_id to keep the
+            decode loop fully asynchronous.
 
         Prefill consumes the whole prompt in one step (filling every layer's cache) —
         the GDN-2 layers push all whole chunks of the prompt through their PARALLEL
@@ -534,6 +558,10 @@ class KimiK3(nnx.Module):
         function: it compiles once per (batch size, cache length) and every further
         token — across generate() calls too — reuses the trace."""
         B, P = prompt_ids.shape
+        if max_new_tokens <= 0:
+            return jnp.zeros((B, 0), prompt_ids.dtype)
+        if temperature > 0.0 and key is None:
+            raise ValueError("temperature > 0 requires a PRNG `key` to sample with")
         # Default the cache length to the config's declared context cap when the
         # request fits inside it: a FIXED cache shape lets _decode_step reuse its
         # compiled trace across generate() calls with different prompt lengths
@@ -542,18 +570,32 @@ class KimiK3(nnx.Module):
 
         caches = self.init_cache(B, max_len)
         logits, caches = self.step(prompt_ids, caches)  # prefill the prompt
-        next_tok = jnp.argmax(logits[:, -1:], axis=-1)  # [B, 1] greedy
-        outs = [next_tok]
+        step_logits = logits[:, -1]  # [B, vocab] at the last prompt position
 
-        for _ in range(max_new_tokens - 1):
-            next_tok, caches = _decode_step(self, next_tok, caches)
+        outs: list[jax.Array] = []
+        done = jnp.zeros((B,), bool)
+        for i in range(max_new_tokens):
+            if temperature > 0.0:
+                key, sub = jax.random.split(key)
+                next_tok = _sample_token(step_logits, sub, temperature, top_p)
+            else:
+                next_tok = jnp.argmax(step_logits, axis=-1)
+            next_tok = next_tok[:, None].astype(prompt_ids.dtype)  # [B, 1]
+            if eos_id is not None:
+                # Finished rows keep emitting eos_id so the batch stays rectangular.
+                next_tok = jnp.where(done[:, None], eos_id, next_tok)
+                done = done | (next_tok[:, 0] == eos_id)
             outs.append(next_tok)
+            if eos_id is not None and bool(done.all()):
+                break
+            if i < max_new_tokens - 1:
+                step_logits, caches = _decode_step(self, next_tok, caches)
 
-        return jnp.concatenate(outs, axis=1)  # [B, max_new_tokens]
+        return jnp.concatenate(outs, axis=1)  # [B, n <= max_new_tokens]
 
 
 # --------------------------------------------------------------------------- #
-#  Jitted greedy decode step, shared by every generate() call.
+#  Jitted decode step, shared by every generate() call.
 #
 #  During decoding everything is shape-constant — the weights, the fixed-size
 #  GDN-2 states, the preallocated MLA latent buffers (position is a TRACED int32,
@@ -566,9 +608,34 @@ class KimiK3(nnx.Module):
 def _decode_step(
     model: KimiK3, tok: jax.Array, caches: list
 ) -> tuple[jax.Array, list]:
-    """One greedy decode step: tok int[B, 1] -> (next greedy token int[B, 1], caches)."""
+    """One decode step: tok int[B, 1] -> (last-position logits f32[B, vocab], caches).
+    Token selection (argmax / sampling) happens in generate(), outside this trace."""
     logits, caches = model.step(tok, caches)
-    return jnp.argmax(logits[:, -1:], axis=-1), caches
+    return logits[:, -1], caches
+
+
+@jax.jit
+def _sample_token(
+    logits: jax.Array, key: jax.Array, temperature: jax.Array, top_p: jax.Array
+) -> jax.Array:
+    """Temperature + nucleus (top-p) sampling: logits f32[B, vocab] -> int[B].
+
+    Scales logits by 1/temperature, then keeps the smallest descending-probability
+    prefix whose mass reaches top_p — token i survives iff the mass strictly before
+    it is < top_p, so the top-1 token always survives and top_p = 1.0 keeps every
+    nonzero-probability token. Everything else is masked to -inf and
+    `jax.random.categorical` samples the (implicitly renormalized) remainder.
+    temperature and top_p are traced scalars, so one compilation serves all values.
+    """
+    logits = logits / temperature
+    sorted_logits = jnp.sort(logits, axis=-1)[..., ::-1]  # descending
+    sorted_probs = jax.nn.softmax(sorted_logits, axis=-1)
+    cum = jnp.cumsum(sorted_probs, axis=-1)
+    keep = cum - sorted_probs < top_p  # mass BEFORE token i < top_p
+    kth = jnp.sum(keep, axis=-1) - 1  # [B] index of the smallest kept logit
+    threshold = jnp.take_along_axis(sorted_logits, kth[:, None], axis=-1)  # [B, 1]
+    filtered = jnp.where(logits >= threshold, logits, -jnp.inf)
+    return jax.random.categorical(key, filtered, axis=-1)
 
 
 def count_params(model: nnx.Module) -> int:

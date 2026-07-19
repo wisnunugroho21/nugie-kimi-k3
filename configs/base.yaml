@@ -24,6 +24,7 @@ model:
   mla_num_kv_heads: 2
   mla_head_dim: 64
   max_seq_len: 1024
+  moe_d_latent: 128 # expert latent width ℓ = d_model/4 (the LatentMoE paper's α = 4)
   moe_d_ff: 1024
   moe_n_routed: 16
   moe_n_shared: 1

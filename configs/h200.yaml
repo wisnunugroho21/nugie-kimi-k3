@@ -1,8 +1,8 @@
 # Single NVIDIA H200 (141 GB, Hopper).
 #
 # Full bf16 with native tensor-core acceleration and fp32 master weights. This is a
-# real ~2.4B-param sparse-MoE run — the H200's memory lets the model, the fp32 Adam
-# state, and long-sequence activations all sit resident.
+# real ~1.1B-param sparse-MoE run — the H200's memory lets the model, the fp32
+# optimizer state, and long-sequence activations all sit resident.
 #
 # TUNING KNOBS (the H200 has headroom to push all of these):
 #   - seq_len / batch_size: the MLA full-attention layers are O(L^2) in memory
@@ -28,6 +28,7 @@ model:
   mla_num_kv_heads: 2
   mla_head_dim: 128
   max_seq_len: 2048
+  moe_d_latent: 256 # expert latent width ℓ = d_model/4 (the LatentMoE paper's α = 4)
   moe_d_ff: 1024
   moe_n_routed: 32
   moe_n_shared: 2

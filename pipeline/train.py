@@ -2,7 +2,7 @@
 Stage 3: the training loop.
 
 Ties everything together:
-    Grain batches  ->  KimiK3 (GDN-2)  ->  CE + MoE aux loss  ->  AdamW (Optax)
+    Grain batches  ->  KimiK3 (GDN-2)  ->  CE + MoE aux loss  ->  Muon/AdamW (Optax)
     ->  aux-loss-free router-bias nudge  ->  Orbax checkpoint.
 
 LOSS
@@ -13,9 +13,11 @@ LOSS
     load using that step's realized `group_sizes`.
 
 OPTIMIZER
-    AdamW with a linear warmup + cosine decay schedule and global-norm gradient
-    clipping. Weight decay is masked OFF for 1-D params (norms, biases, the GDN-2
-    A_log / dt_bias) and applied only to weight matrices — the standard recipe.
+    The Moonlight Muon/AdamW split (pipeline/optimizer.py): hidden weight matrices
+    get Muon (orthogonalized momentum with consistent-RMS scaling), while the
+    embedding, LM head, biases, norm gains, and the GDN-2 A_log / dt_bias decay
+    parameters get AdamW. One linear warmup + cosine decay schedule and global-norm
+    gradient clipping cover both sides; weight decay touches only the Muon matrices.
 
 MIXED PRECISION
     Governed entirely by model.compute_dtype (fp32 by default; set "bfloat16" on a
