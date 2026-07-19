@@ -87,6 +87,12 @@ Constraints validated at startup: `data.seq_len` must be a multiple of
 `model.gdn_chunk_size` and at most `model.max_seq_len`; `model.vocab_size` must
 match the tokenized data; `train.batch_size` must divide by the device count.
 
+**Gradient checkpointing** (`model.remat`, enabled in the GPU configs): each
+decoder layer is recomputed during the backward pass instead of storing its
+activations — activation memory stops growing with depth, for ~1/3 extra
+forward compute. Gradients are identical to the un-checkpointed forward
+(tested); inference (`step`/`generate`) is unaffected.
+
 ## Inference API
 
 ```python
