@@ -178,6 +178,15 @@ class GroupedGemmMoE(nnx.Module):
 
         return top_idx, gate, logits
 
+    @staticmethod
+    def _norm_sigmoid_probs(router_logits: jax.Array) -> jax.Array:
+        """Mean normalized sigmoid affinity per expert, P_e = mean_t s'_{e,t} with
+        s'_{e,t} = sigmoid(logit_{e,t}) / Σ_e' sigmoid(logit_{e',t}) — the P_e of
+        DeepSeek-V3's sequence-level balancing loss (its Eq. 18), consistent with
+        the sigmoid scoring `_route` selects and gates with. [T, E] -> [E]."""
+        scores = jax.nn.sigmoid(router_logits)
+        return (scores / (scores.sum(-1, keepdims=True) + 1e-9)).mean(0)
+
     def _shared(self, x_flat: jax.Array) -> jax.Array:
         """Shared expert(s) as a single wider SwiGLU (always applied to every token).
         Runs the matmuls in compute_dtype (bf16 on H200); the caller upcasts the
@@ -230,11 +239,15 @@ class GroupedGemmMoE(nnx.Module):
         load = group_sizes.astype(F32) / (T * k)  # fraction per expert
 
         # ---- aux loss ----
-        # Switch/DeepSeek-style aux loss: E * <f_e, P_e>, where f_e is the realized
-        # per-expert load fraction (non-differentiable; acts as a constant) and P_e
-        # the mean softmax routing probability (this is where the gradient flows).
-        # Reuses the logits already computed by _route (no second router matmul).
-        probs = jax.nn.softmax(router_logits, axis=-1).mean(0)  # [E]
+        # DeepSeek-V3-style sequence-level balancing loss: E * <f_e, P_e>, where
+        # f_e is the realized per-expert load fraction (non-differentiable; acts
+        # as a constant) and P_e the mean NORMALIZED SIGMOID affinity
+        # s'_e = sigmoid(logit_e) / Σ_e' sigmoid(logit_e') — the same scoring the
+        # router actually selects with (V3 Eq. 17-20), not a softmax, so the aux
+        # gradient pushes on the exact quantity routing consumes. Reuses the
+        # logits already computed by _route (no second router matmul; the extra
+        # sigmoid is elementwise).
+        probs = self._norm_sigmoid_probs(router_logits)  # [E]
         aux_loss = self.aux_alpha * self.E * jnp.sum(load * probs)
         aux = {"load": load, "aux_loss": aux_loss, "group_sizes": group_sizes}
         return out, aux

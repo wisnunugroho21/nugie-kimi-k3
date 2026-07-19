@@ -46,6 +46,23 @@ def test_latent_moe_matches_dense():
     np.testing.assert_allclose(float(aux["load"].sum()), 1.0, rtol=1e-6)
 
 
+def test_aux_loss_uses_normalized_sigmoid_probs():
+    """The balancing loss must build P_e from the NORMALIZED SIGMOID affinities
+    the router routes with (DeepSeek-V3 Eq. 18), not a softmax."""
+    moe = GroupedGemmMoE(
+        D_MODEL, D_FF, n_routed=8, n_shared=1, top_k=2, rngs=nnx.Rngs(0))
+    x = _x(3)
+    _, aux = moe(x)
+
+    logits = moe.router(x.reshape(-1, D_MODEL)).astype(jnp.float32)
+    scores = jax.nn.sigmoid(logits)
+    probs = (scores / (scores.sum(-1, keepdims=True) + 1e-9)).mean(0)
+    load = aux["group_sizes"].astype(jnp.float32) / aux["group_sizes"].sum()
+    expected = moe.aux_alpha * moe.E * jnp.sum(load * probs)
+    np.testing.assert_allclose(float(aux["aux_loss"]), float(expected),
+                               rtol=1e-6, atol=1e-8)
+
+
 def test_group_limited_routing_respects_groups():
     """Every token's top-k experts must fall inside its topk_groups best groups."""
     n_routed, n_groups, topk_groups, top_k = 8, 4, 2, 2

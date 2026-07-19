@@ -38,8 +38,9 @@ WHAT IS REUSED
 Routing is INHERITED from GroupedGemmMoE, verbatim: sigmoid affinities, the
 aux-loss-free selection bias (`router_bias` + `update_router_bias` in the
 training loop), group-limited routing, normalized top-k gate weights, and the
-optional Switch-style aux loss. The aux dict keys ("load", "aux_loss",
-"group_sizes") are unchanged, so the model/training-loop contract is identical.
+optional DeepSeek-V3-style sequence-level balancing aux loss. The aux dict keys
+("load", "aux_loss", "group_sizes") are unchanged, so the model/training-loop
+contract is identical.
 The dispatch machinery (sort by expert id -> ragged_dot grouped GEMMs ->
 scatter-add combine) is also the same pattern, just run at latent width — the
 dispatch/combine memory traffic shrinks by α too.
@@ -212,8 +213,10 @@ class LatentMoE(GroupedGemmMoE):
         out = out.reshape(B, L, d).astype(cdtype)
 
         # ---- diagnostics + aux loss: identical contract to the parent ----
+        # (normalized-sigmoid P_e, consistent with the sigmoid routing — see
+        # GroupedGemmMoE.__call__ / _norm_sigmoid_probs.)
         load = group_sizes.astype(F32) / (T * k)
-        probs = jax.nn.softmax(router_logits, axis=-1).mean(0)  # [E]
+        probs = self._norm_sigmoid_probs(router_logits)  # [E]
         aux_loss = self.aux_alpha * self.E * jnp.sum(load * probs)
         aux = {"load": load, "aux_loss": aux_loss, "group_sizes": group_sizes}
         return out, aux
