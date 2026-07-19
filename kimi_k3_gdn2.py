@@ -181,6 +181,13 @@ class KimiK3Config:
 
     rms_eps: float = 1e-5
 
+    # --- Gradient checkpointing (remat) ---
+    # When True, each decoder layer's activations are RECOMPUTED during the
+    # backward pass instead of stored — activation memory stops growing with
+    # depth, at the cost of one extra forward (~1/3 more compute). Only the
+    # training __call__ path is affected; step/generate are untouched.
+    remat: bool = False
+
     # --- Mixed precision ---
     # Matmul (compute) dtype for the projection Linears + MoE expert GEMMs. Master
     # weights are ALWAYS stored fp32 (param_dtype), and the numerically sensitive
@@ -463,7 +470,10 @@ class KimiK3(nnx.Module):
         partial: jax.Array | None = None
 
         for layer in self.layers:
-            blocks, partial, aux = layer(blocks, partial)
+            if self.cfg.remat:
+                blocks, partial, aux = _layer_forward_remat(layer, blocks, partial)
+            else:
+                blocks, partial, aux = layer(blocks, partial)
 
             aux_loss = aux_loss + aux["aux_loss"]
             group_sizes.append(aux["group_sizes"])
@@ -592,6 +602,29 @@ class KimiK3(nnx.Module):
                 step_logits, caches = _decode_step(self, next_tok, caches)
 
         return jnp.concatenate(outs, axis=1)  # [B, n <= max_new_tokens]
+
+
+# --------------------------------------------------------------------------- #
+#  Gradient-checkpointed layer application (cfg.remat).
+#
+#  Implemented as a PURE jax.checkpoint over the layer's split state rather
+#  than nnx.remat: the layer forward is read-only (no variable mutation), so
+#  split -> checkpoint(merge-and-call) is exact, and it composes cleanly with
+#  the training loop's own split/merge + shard_map (nnx.remat's lifted
+#  machinery raises TraceContextError inside that combination). Only the layer
+#  INPUTS (the depth-wise sources) are saved for backward; everything inside
+#  the layer — projections, conv, chunkwise core, attention, MoE dispatch —
+#  is recomputed.
+# --------------------------------------------------------------------------- #
+def _layer_forward_remat(
+    layer: DecoderLayer, blocks: list[jax.Array], partial: jax.Array | None
+) -> tuple[list[jax.Array], jax.Array, dict[str, jax.Array]]:
+    graphdef, state = nnx.split(layer)
+
+    def fwd(state, blocks, partial):
+        return nnx.merge(graphdef, state)(blocks, partial)
+
+    return jax.checkpoint(fwd)(state, blocks, partial)
 
 
 # --------------------------------------------------------------------------- #

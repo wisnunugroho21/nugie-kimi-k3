@@ -125,6 +125,28 @@ def test_mla_step_matches_call():
         jnp.concatenate([out1, out2], axis=1), full, rtol=2e-4, atol=2e-4)
 
 
+def test_remat_matches_no_remat():
+    """cfg.remat must change memory behavior only: identical logits, aux, and
+    gradients versus the un-checkpointed forward."""
+    import optax
+
+    model = make_model()
+    model_r = make_model(KimiK3Config(**{**CFG.__dict__, "remat": True}))
+    ids = jax.random.randint(jax.random.PRNGKey(9), (2, 32), 0, CFG.vocab_size)
+    tgt = jax.random.randint(jax.random.PRNGKey(10), (2, 32), 0, CFG.vocab_size)
+
+    def loss(m):
+        logits, aux = m(ids)
+        ce = optax.softmax_cross_entropy_with_integer_labels(logits, tgt).mean()
+        return ce + aux["aux_loss"]
+
+    l1, g1 = nnx.value_and_grad(loss)(model)
+    l2, g2 = nnx.value_and_grad(loss)(model_r)
+    np.testing.assert_allclose(float(l1), float(l2), rtol=1e-6)
+    for a, b in zip(jax.tree.leaves(g1), jax.tree.leaves(g2)):
+        np.testing.assert_allclose(a, b, rtol=1e-5, atol=1e-6)
+
+
 def test_muon_adamw_split_and_step():
     """Every 2-D Linear kernel and 3-D expert stack goes to Muon; embedding,
     LM head, 1-D params, and conv kernels go to AdamW — and one optimizer

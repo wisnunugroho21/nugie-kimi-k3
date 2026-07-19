@@ -32,6 +32,7 @@ model:
   moe_n_shared: 1
   moe_top_k: 2
   compute_dtype: bfloat16
+  remat: true # gradient checkpointing: ~1/3 more compute for far less activation memory
 
 data:
   data_dir: data/codeparrot
