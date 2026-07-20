@@ -21,12 +21,26 @@ from multi_latent_attention.attention import GroupedQueryLatentAttention
 from pipeline.optimizer import make_optimizer
 
 CFG = KimiK3Config(
-    vocab_size=64, d_model=32, n_layers=4, full_attn_period=4,
+    vocab_size=64,
+    d_model=32,
+    n_layers=4,
+    full_attn_period=4,
     attn_res_layers_per_block=2,
-    gdn_num_heads=2, gdn_head_k_dim=8, gdn_head_v_dim=8, gdn_chunk_size=16,
-    mla_num_q_heads=4, mla_num_kv_heads=2, mla_head_dim=8, max_seq_len=64,
-    moe_d_latent=8, moe_d_ff=32, moe_n_routed=8, moe_n_shared=1, moe_top_k=2,
-    moe_n_groups=4, moe_topk_groups=2,
+    gdn_num_heads=2,
+    gdn_head_k_dim=8,
+    gdn_head_v_dim=8,
+    gdn_chunk_size=16,
+    mla_num_q_heads=4,
+    mla_num_kv_heads=2,
+    mla_head_dim=8,
+    max_seq_len=64,
+    moe_d_latent=8,
+    moe_d_ff=32,
+    moe_n_routed=8,
+    moe_n_shared=1,
+    moe_top_k=2,
+    moe_n_groups=4,
+    moe_topk_groups=2,
 )
 
 
@@ -71,10 +85,12 @@ def test_generate_greedy_and_sampling():
     assert g1.shape == (1, 12)
     np.testing.assert_array_equal(g1, g2)  # greedy is deterministic
 
-    s1 = model.generate(prompt, max_new_tokens=12, temperature=1.0, top_p=0.9,
-                        key=jax.random.PRNGKey(0))
-    s2 = model.generate(prompt, max_new_tokens=12, temperature=1.0, top_p=0.9,
-                        key=jax.random.PRNGKey(0))
+    s1 = model.generate(
+        prompt, max_new_tokens=12, temperature=1.0, top_p=0.9, key=jax.random.PRNGKey(0)
+    )
+    s2 = model.generate(
+        prompt, max_new_tokens=12, temperature=1.0, top_p=0.9, key=jax.random.PRNGKey(0)
+    )
     assert s1.shape == (1, 12)
     np.testing.assert_array_equal(s1, s2)  # same key -> same sample
 
@@ -111,7 +127,7 @@ def test_generate_eos_early_stop():
     row0 = np.asarray(gen[0])
     hits = np.nonzero(row0 == eos)[0]
     assert hits.size > 0
-    assert (row0[hits[0]:] == eos).all()  # padding after the first EOS
+    assert (row0[hits[0] :] == eos).all()  # padding after the first EOS
 
 
 def test_attn_res_off_is_plain_residual_stream():
@@ -121,22 +137,20 @@ def test_attn_res_off_is_plain_residual_stream():
     logits, _ = model(ids)
     assert jnp.isfinite(logits).all()
     # No AttnRes parameters are allocated when the backbone is disabled.
-    names = [str(p) for p, _ in jax.tree_util.tree_leaves_with_path(
-        nnx.state(model, nnx.Param))]
+    names = [str(p) for p, _ in jax.tree_util.tree_leaves_with_path(nnx.state(model, nnx.Param))]
     assert not any("res_mixer" in n for n in names)
 
 
 def test_mla_step_matches_call():
     attn = GroupedQueryLatentAttention(
-        embed_dim=32, num_q_heads=4, num_kv_heads=2, head_dim=8,
-        gated=True, rngs=nnx.Rngs(0))
+        embed_dim=32, num_q_heads=4, num_kv_heads=2, head_dim=8, gated=True, rngs=nnx.Rngs(0)
+    )
     x = jax.random.normal(jax.random.PRNGKey(5), (2, 20, 32))
     full = attn(x)
     cache = attn.init_cache(2, max_len=20)
     out1, cache = attn.step(x[:, :13], cache)
     out2, _ = attn.step(x[:, 13:], cache)
-    np.testing.assert_allclose(
-        jnp.concatenate([out1, out2], axis=1), full, rtol=2e-4, atol=2e-4)
+    np.testing.assert_allclose(jnp.concatenate([out1, out2], axis=1), full, rtol=2e-4, atol=2e-4)
 
     with pytest.raises(ValueError, match="capacity exceeded"):
         attn.step(x[:, :1], cache._replace(pos=jnp.array(20, jnp.int32)))
@@ -160,7 +174,7 @@ def test_remat_matches_no_remat():
     l1, g1 = nnx.value_and_grad(loss)(model)
     l2, g2 = nnx.value_and_grad(loss)(model_r)
     np.testing.assert_allclose(float(l1), float(l2), rtol=1e-6)
-    for a, b in zip(jax.tree.leaves(g1), jax.tree.leaves(g2)):
+    for a, b in zip(jax.tree.leaves(g1), jax.tree.leaves(g2), strict=True):
         np.testing.assert_allclose(a, b, rtol=1e-5, atol=1e-6)
 
 
@@ -173,8 +187,7 @@ def test_muon_adamw_split_and_step():
     model = make_model()
     params = nnx.state(model, nnx.Param)
     for path, leaf in jax.tree_util.tree_leaves_with_path(params):
-        names = {getattr(k, "key", getattr(k, "name", getattr(k, "idx", "")))
-                 for k in path}
+        names = {getattr(k, "key", getattr(k, "name", getattr(k, "idx", ""))) for k in path}
         names = {str(n) for n in names}
         spec = _muon_spec(path, leaf)
         if names & {"embed", "lm_head", "A_log"} or leaf.ndim == 1:
@@ -184,8 +197,7 @@ def test_muon_adamw_split_and_step():
         elif leaf.ndim == 2:
             assert spec is not None, path
 
-    optimizer = make_optimizer(
-        model, optax.constant_schedule(1e-3), verbose=False)
+    optimizer = make_optimizer(model, optax.constant_schedule(1e-3), verbose=False)
     ids = jax.random.randint(jax.random.PRNGKey(6), (2, 32), 0, CFG.vocab_size)
     tgt = jax.random.randint(jax.random.PRNGKey(7), (2, 32), 0, CFG.vocab_size)
 

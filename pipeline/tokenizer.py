@@ -41,9 +41,9 @@ class ByteTokenizer:
         return list(text.encode("utf-8"))
 
     def decode(self, ids: list[int]) -> str:
-        return bytes(
-            b for b in ids if 0 <= b < 256 and b != self.eos_id
-        ).decode("utf-8", errors="replace")
+        return bytes(b for b in ids if 0 <= b < 256 and b != self.eos_id).decode(
+            "utf-8", errors="replace"
+        )
 
 
 class HFTokenizer:
@@ -64,9 +64,7 @@ class HFTokenizer:
         # meta.json's vocab check) must be sized by len(tok).
         self.vocab_size = len(self._tok)
         if eos is None:
-            raise ValueError(
-                f"Tokenizer {name!r} defines neither eos_token_id nor bos_token_id"
-            )
+            raise ValueError(f"Tokenizer {name!r} defines neither eos_token_id nor bos_token_id")
         self.eos_id = int(eos)
 
     def encode(self, text: str) -> list[int]:

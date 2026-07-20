@@ -114,9 +114,7 @@ class GroupedGemmMoE(nnx.Module):
         # stay fp32 below for stable routing/load-balancing.
         self.compute_dtype = compute_dtype
 
-        self.router = nnx.Linear(
-            d_model, n_routed, use_bias=False, kernel_init=_XAVIER, rngs=rngs
-        )
+        self.router = nnx.Linear(d_model, n_routed, use_bias=False, kernel_init=_XAVIER, rngs=rngs)
         self.router_bias = nnx.Variable(jnp.zeros((n_routed,), F32))
 
         # Stacked routed-expert weights. Gate and up are fused into W_in so the
@@ -132,15 +130,9 @@ class GroupedGemmMoE(nnx.Module):
         # Shared expert(s) as a single wider SwiGLU (always applied to every token).
         sg, su, sd = jax.random.split(rngs.params(), 3)
         ish = d_ff * n_shared
-        self.ws_gate = nnx.Param(
-            jax.random.normal(sg, (d_model, ish), F32) * (d_model**-0.5)
-        )
-        self.ws_up = nnx.Param(
-            jax.random.normal(su, (d_model, ish), F32) * (d_model**-0.5)
-        )
-        self.ws_down = nnx.Param(
-            jax.random.normal(sd, (ish, d_model), F32) * (ish**-0.5)
-        )
+        self.ws_gate = nnx.Param(jax.random.normal(sg, (d_model, ish), F32) * (d_model**-0.5))
+        self.ws_up = nnx.Param(jax.random.normal(su, (d_model, ish), F32) * (d_model**-0.5))
+        self.ws_down = nnx.Param(jax.random.normal(sd, (ish, d_model), F32) * (ish**-0.5))
 
     # ----------------------------------------------------------------------- #
     def _route(self, x_flat: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
@@ -174,11 +166,7 @@ class GroupedGemmMoE(nnx.Module):
             top2, _ = jax.lax.top_k(sel_g, min(2, gsize))
             group_score = top2.sum(-1)  # [T, n_groups]
             _, gidx = jax.lax.top_k(group_score, self.topk_groups)  # [T, topk_groups]
-            keep = (
-                jnp.zeros((T, self.n_groups), bool)
-                .at[jnp.arange(T)[:, None], gidx]
-                .set(True)
-            )
+            keep = jnp.zeros((T, self.n_groups), bool).at[jnp.arange(T)[:, None], gidx].set(True)
             sel = jnp.where(jnp.repeat(keep, gsize, axis=-1), sel, -jnp.inf)
 
         _, top_idx = jax.lax.top_k(sel, self.top_k)  # selection [T,k]
@@ -235,15 +223,11 @@ class GroupedGemmMoE(nnx.Module):
         h = jax.lax.ragged_dot(x_sorted, self.w_in.astype(cdtype), group_sizes)
         g_, u_ = jnp.split(h, 2, axis=-1)  # [M, d_ff] each
         a = jax.nn.silu(g_) * u_
-        y_sorted = jax.lax.ragged_dot(
-            a, self.w_out.astype(cdtype), group_sizes
-        )  # [M,d]
+        y_sorted = jax.lax.ragged_dot(a, self.w_out.astype(cdtype), group_sizes)  # [M,d]
 
         # ---- combine: weight, un-permute, sum top-k per token ----
         y_sorted = y_sorted.astype(F32) * sort_w[:, None]
-        routed = (
-            jnp.zeros((T, d), F32).at[sort_tok].add(y_sorted)
-        )  # scatter-add over slots
+        routed = jnp.zeros((T, d), F32).at[sort_tok].add(y_sorted)  # scatter-add over slots
 
         out = routed + self._shared(xf).astype(F32)
         out = out.reshape(B, L, d).astype(cdtype)
@@ -287,9 +271,7 @@ class GroupedGemmMoE(nnx.Module):
 
 
 # --------------------------------------------------------------------------- #
-def update_router_bias(
-    bias: jax.Array, group_sizes: jax.Array, lr: float = 1e-3
-) -> jax.Array:
+def update_router_bias(bias: jax.Array, group_sizes: jax.Array, lr: float = 1e-3) -> jax.Array:
     """Aux-loss-free load balancing (DeepSeek-V3 style), called in the training loop
     AFTER each step, outside the gradient:
 

@@ -129,9 +129,7 @@ class LatentMoE(GroupedGemmMoE):
         # Router on the FULL-dimensional token (paper §3: routing weights are
         # computed from the original x, BEFORE the latent compression) + the
         # aux-loss-free selection bias, exactly as in GroupedGemmMoE.
-        self.router = nnx.Linear(
-            d_model, n_routed, use_bias=False, kernel_init=_XAVIER, rngs=rngs
-        )
+        self.router = nnx.Linear(d_model, n_routed, use_bias=False, kernel_init=_XAVIER, rngs=rngs)
         self.router_bias = nnx.Variable(jnp.zeros((n_routed,), F32))
 
         # Shared latent projections: ONE pair for all routed experts.
@@ -158,8 +156,7 @@ class LatentMoE(GroupedGemmMoE):
         # (two grouped GEMMs per forward, as in the parent), fan-in init.
         kin, kout = jax.random.split(rngs.params(), 2)
         self.w_in = nnx.Param(
-            jax.random.normal(kin, (n_routed, d_latent, 2 * d_ff), F32)
-            * (d_latent**-0.5)
+            jax.random.normal(kin, (n_routed, d_latent, 2 * d_ff), F32) * (d_latent**-0.5)
         )
         self.w_out = nnx.Param(
             jax.random.normal(kout, (n_routed, d_ff, d_latent), F32) * (d_ff**-0.5)
@@ -170,15 +167,9 @@ class LatentMoE(GroupedGemmMoE):
         # _shared works unchanged.
         sg, su, sd = jax.random.split(rngs.params(), 3)
         ish = d_ff * n_shared
-        self.ws_gate = nnx.Param(
-            jax.random.normal(sg, (d_model, ish), F32) * (d_model**-0.5)
-        )
-        self.ws_up = nnx.Param(
-            jax.random.normal(su, (d_model, ish), F32) * (d_model**-0.5)
-        )
-        self.ws_down = nnx.Param(
-            jax.random.normal(sd, (ish, d_model), F32) * (ish**-0.5)
-        )
+        self.ws_gate = nnx.Param(jax.random.normal(sg, (d_model, ish), F32) * (d_model**-0.5))
+        self.ws_up = nnx.Param(jax.random.normal(su, (d_model, ish), F32) * (d_model**-0.5))
+        self.ws_down = nnx.Param(jax.random.normal(sd, (ish, d_model), F32) * (ish**-0.5))
 
     # ----------------------------------------------------------------------- #
     def __call__(self, x: jax.Array) -> tuple[jax.Array, dict[str, jax.Array]]:
@@ -214,9 +205,7 @@ class LatentMoE(GroupedGemmMoE):
         h = jax.lax.ragged_dot(z_sorted, self.w_in.astype(cdtype), group_sizes)
         g_, u_ = jnp.split(h, 2, axis=-1)  # [M, d_ff] each
         a = jax.nn.silu(g_) * u_
-        y_sorted = jax.lax.ragged_dot(
-            a, self.w_out.astype(cdtype), group_sizes
-        )  # [M, d_latent]
+        y_sorted = jax.lax.ragged_dot(a, self.w_out.astype(cdtype), group_sizes)  # [M, d_latent]
 
         # ---- combine IN THE LATENT, then one shared up-projection ----
         y_sorted = y_sorted.astype(F32) * sort_w[:, None]

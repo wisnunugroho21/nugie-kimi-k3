@@ -271,8 +271,8 @@ def _chunk_inputs(q, k, v, g, b, w, S0, chunk_size):
     C = chunk_size
     if C <= 0 or L <= 0 or L % C:
         raise ValueError(
-            f"chunk_size={C} must be a positive divisor of the non-empty sequence "
-            f"length L={L}")
+            f"chunk_size={C} must be a positive divisor of the non-empty sequence length L={L}"
+        )
     N = L // C
 
     def to_chunks(x):
@@ -321,8 +321,10 @@ def _wy_solve(T: jax.Array, Ebar: jax.Array, Z: jax.Array):
     dk = Ebar.shape[-1]
     eye = jnp.eye(T.shape[-1], dtype=T.dtype)
     YU = jax.scipy.linalg.solve_triangular(
-        eye + T, jnp.concatenate([Ebar, Z], axis=-1),
-        lower=True, unit_diagonal=True,
+        eye + T,
+        jnp.concatenate([Ebar, Z], axis=-1),
+        lower=True,
+        unit_diagonal=True,
     )
     return YU[..., :dk], YU[..., dk:]
 
@@ -527,21 +529,21 @@ def _chunkwise_single_stacked_RHS_solve(
 
     # Literal paper factors, identical to _chunkwise_single_faithful — see
     # its comments for the derivation of each quantity.
-    G = jnp.cumsum(g, axis=1)                    # Eq. 18/30       [N, C, dk]
-    gamma = jnp.exp(G)                           # Eq. 18/30       [N, C, dk]
-    gamma_C = gamma[:, -1]                       # total chunk decay  [N, dk]
-    Kbar = k * jnp.exp(-G)                       # Eq. 19/33 (overflow source)
-    Ebar = gamma * (b * k)                       # Eq. 20/33       [N, C, dk]
-    Z = w * v                                    # Eq. 8, 20/33    [N, C, dv]
-    Qg = gamma * q                               # Eq. 24/43       [N, C, dk]
+    G = jnp.cumsum(g, axis=1)  # Eq. 18/30       [N, C, dk]
+    gamma = jnp.exp(G)  # Eq. 18/30       [N, C, dk]
+    gamma_C = gamma[:, -1]  # total chunk decay  [N, dk]
+    Kbar = k * jnp.exp(-G)  # Eq. 19/33 (overflow source)
+    Ebar = gamma * (b * k)  # Eq. 20/33       [N, C, dk]
+    Z = w * v  # Eq. 8, 20/33    [N, C, dv]
+    Qg = gamma * q  # Eq. 24/43       [N, C, dk]
     T = jnp.tril(Ebar @ Kbar.swapaxes(-1, -2), k=-1)  # Eq. 21/34  [N, C, C]
 
     # Eqs. 21/34 + 22/34 via ONE stacked-RHS forward substitution — the
     # solver optimization this core exists to isolate (see _wy_solve).
     Y, U = _wy_solve(T, Ebar, Z)
 
-    Aqk = jnp.tril(Qg @ Kbar.swapaxes(-1, -2))   # Eq. 25/43       [N, C, C]
-    Ktail = k * (gamma_C[:, None, :] / gamma)    # Eq. 23/41 (NaN when γ underflows)
+    Aqk = jnp.tril(Qg @ Kbar.swapaxes(-1, -2))  # Eq. 25/43       [N, C, C]
+    Ktail = k * (gamma_C[:, None, :] / gamma)  # Eq. 23/41 (NaN when γ underflows)
 
     return _cross_chunk_scan(S0, Y, U, Aqk, Qg, Ktail, gamma_C)
 
@@ -699,7 +701,7 @@ def _chunkwise_single_pairwise(
     # T is built with D_incl and the s = r scores are discarded afterwards
     # by a strict tril on the small [N, C, C] result — saving a second
     # full-tensor exp/where pass and its memory.
-    causal = jnp.tril(jnp.ones((C, C), dtype=bool))        # s ≤ r
+    causal = jnp.tril(jnp.ones((C, C), dtype=bool))  # s ≤ r
     neg_inf = jnp.array(-jnp.inf, dtype=D_TYPE)
     D_incl = jnp.exp(jnp.where(causal[None, :, :, None], Gdiff, neg_inf))
 
@@ -707,12 +709,12 @@ def _chunkwise_single_pairwise(
     # Same entries as tril(Ē K̄ᵀ, −1), but the decay enters as a bounded
     # per-triple factor instead of two unbounded row/column scalings — an
     # einsum with a [C, C, dk] operand, not a matmul.            [N, C, C]
-    T = jnp.tril(jnp.einsum('nrc,nsc,nrsc->nrs', e, k, D_incl), k=-1)
+    T = jnp.tril(jnp.einsum("nrc,nsc,nrsc->nrs", e, k, D_incl), k=-1)
 
     # Eq. 25/43:  (A_qk)_rs = q_rᵀ Diag(γ_r/γ_s) k_s, s ≤ r — decay-aware
     # causal attention scores, same pairwise construction (diagonal
     # included: self-read, ratio = 1).                            [N, C, C]
-    Aqk = jnp.einsum('nrc,nsc,nrsc->nrs', q, k, D_incl)
+    Aqk = jnp.einsum("nrc,nsc,nrsc->nrs", q, k, D_incl)
 
     # Absolute-γ factors, exponents G ≤ 0 so exp ∈ (0,1] — always safe;
     # no centering shift and no delta pre-scale are needed in this variant.
@@ -786,16 +788,15 @@ def _chunkwise_single_subchunking(
     C = chunk_size
     c = sub_chunk_size
     if c <= 0 or C % c:
-        raise ValueError(
-            f"sub_chunk_size={c} must be a positive divisor of chunk_size={C}")
+        raise ValueError(f"sub_chunk_size={c} must be a positive divisor of chunk_size={C}")
     (q, k, v, g, b, w), S0 = _chunk_inputs(q, k, v, g, b, w, S0, chunk_size)
     N, _, dk = k.shape
-    M = C // c   # sub-blocks per chunk
+    M = C // c  # sub-blocks per chunk
 
-    e = b * k                       # Eq. 8: erase directions   [N, C, dk]
+    e = b * k  # Eq. 8: erase directions   [N, C, dk]
 
     # Eq. 18/30:  G_r = Σ_{i≤r} g_i, within-chunk cumulative log-decay.
-    G = jnp.cumsum(g, axis=1)       # [N, C, dk]
+    G = jnp.cumsum(g, axis=1)  # [N, C, dk]
 
     # Total chunk log-decay and carry coefficient of Eq. 23/40.     [N, dk]
     G_C = G[:, -1]
@@ -805,18 +806,16 @@ def _chunkwise_single_subchunking(
     # Sub-block view of G and the entry boundary B_i of each sub-block
     # (cumulative log-decay at the last position BEFORE the block; B_0 = 0,
     # matching γ_0 = 1 of Eq. 18/30 at the second level).
-    G4 = G.reshape(N, M, c, dk)                                  # [N, M, c, dk]
-    B = jnp.concatenate(
-        [jnp.zeros((N, 1, dk), dtype=D_TYPE), G4[:, :-1, -1]], axis=1
-    )                                                            # [N, M, dk]
+    G4 = G.reshape(N, M, c, dk)  # [N, M, c, dk]
+    B = jnp.concatenate([jnp.zeros((N, 1, dk), dtype=D_TYPE), G4[:, :-1, -1]], axis=1)  # [N, M, dk]
 
     # Block-local log-decay Grel_r = G_r − B_i ≤ 0 (r is inside block i, at
     # or after its boundary), so exp(Grel) ∈ (0, 1] — always safe.
-    Grel = G4 - B[:, :, None, :]                                 # [N, M, c, dk]
+    Grel = G4 - B[:, :, None, :]  # [N, M, c, dk]
 
     # Row-side factors carrying exp(G_r − B_i): the "Ē/Q_γ of the sub-block".
-    Erow = e.reshape(N, M, c, dk) * jnp.exp(Grel)                # [N, M, c, dk]
-    Qrow = q.reshape(N, M, c, dk) * jnp.exp(Grel)                # [N, M, c, dk]
+    Erow = e.reshape(N, M, c, dk) * jnp.exp(Grel)  # [N, M, c, dk]
+    Qrow = q.reshape(N, M, c, dk) * jnp.exp(Grel)  # [N, M, c, dk]
 
     # Column-side keys rescaled per ROW-block: exp(B_i − G_s) ≤ 1 for s in
     # any earlier sub-block. Masked to −inf BEFORE the exp — for s at or
@@ -824,17 +823,16 @@ def _chunkwise_single_subchunking(
     # also implements the block-level causal mask. This [N, M, C, dk] tensor
     # is the ×(C/c) memory cost of the variant.
     neg_inf = jnp.array(-jnp.inf, dtype=D_TYPE)
-    col_blk = jnp.arange(C) // c                                 # [C] block of s
-    past = col_blk[None, :] < jnp.arange(M)[:, None]             # [M, C] j < i
-    expo = jnp.where(past[None, :, :, None],
-                     B[:, :, None, :] - G[:, None, :, :], neg_inf)
-    Ksc = k[:, None, :, :] * jnp.exp(expo)                       # [N, M, C, dk]
+    col_blk = jnp.arange(C) // c  # [C] block of s
+    past = col_blk[None, :] < jnp.arange(M)[:, None]  # [M, C] j < i
+    expo = jnp.where(past[None, :, :, None], B[:, :, None, :] - G[:, None, :, :], neg_inf)
+    Ksc = k[:, None, :, :] * jnp.exp(expo)  # [N, M, C, dk]
 
     # OFF-DIAGONAL blocks of Eq. 21/34 and Eq. 25/43: for each row-block i,
     # T_rs = (e_r exp(G_r − B_i))ᵀ (k_s exp(B_i − G_s)) — a batched matmul
     # [M, c, dk] @ [M, dk, C]; columns in blocks ≥ i are exactly 0.
-    T_off = jnp.einsum('nmrd,nmsd->nmrs', Erow, Ksc).reshape(N, C, C)
-    Aqk_off = jnp.einsum('nmrd,nmsd->nmrs', Qrow, Ksc).reshape(N, C, C)
+    T_off = jnp.einsum("nmrd,nmsd->nmrs", Erow, Ksc).reshape(N, C, C)
+    Aqk_off = jnp.einsum("nmrd,nmsd->nmrs", Qrow, Ksc).reshape(N, C, C)
 
     # DIAGONAL c×c blocks: pairwise log-space differences within each
     # sub-block (B_i cancels: Grel_r − Grel_s = G_r − G_s). Exponents ≤ 0
@@ -845,34 +843,29 @@ def _chunkwise_single_subchunking(
     # with D_incl and the s = r scores are discarded by a strict tril on
     # the small [N, M, c, c] result.                     Gd: [N, M, c, c, dk]
     Gd = Grel[:, :, :, None, :] - Grel[:, :, None, :, :]
-    causal = jnp.tril(
-        jnp.ones((c, c), dtype=bool)
-    )       # s <= r
-    D_incl = jnp.exp(
-        jnp.where(causal[None, None, :, :, None], Gd, neg_inf)
-    )
+    causal = jnp.tril(jnp.ones((c, c), dtype=bool))  # s <= r
+    D_incl = jnp.exp(jnp.where(causal[None, None, :, :, None], Gd, neg_inf))
     kg = k.reshape(N, M, c, dk)
     T_diag = jnp.tril(
-        jnp.einsum(
-            'nmrc,nmsc,nmrsc->nmrs',
-            e.reshape(N, M, c, dk), kg, D_incl),
-        k=-1)                                                   # [N, M, c, c]
-    Aqk_diag = jnp.einsum('nmrc,nmsc,nmrsc->nmrs',
-                          q.reshape(N, M, c, dk), kg, D_incl)   # [N, M, c, c]
+        jnp.einsum("nmrc,nmsc,nmrsc->nmrs", e.reshape(N, M, c, dk), kg, D_incl), k=-1
+    )  # [N, M, c, c]
+    Aqk_diag = jnp.einsum(
+        "nmrc,nmsc,nmrsc->nmrs", q.reshape(N, M, c, dk), kg, D_incl
+    )  # [N, M, c, c]
 
     # Scatter the diagonal blocks into the [C, C] score matrices (the
     # off-diagonal parts are 0 there, so add == set).
     rr = jnp.arange(M)[:, None, None] * c + jnp.arange(c)[None, :, None]
     ss = jnp.arange(M)[:, None, None] * c + jnp.arange(c)[None, None, :]
-    T = T_off.at[:, rr, ss].add(T_diag)      # Eq. 21/34          [N, C, C]
+    T = T_off.at[:, rr, ss].add(T_diag)  # Eq. 21/34          [N, C, C]
     Aqk = Aqk_off.at[:, rr, ss].add(Aqk_diag)  # Eq. 25/43        [N, C, C]
 
     # ---- From here on identical to the pairwise core ----------------------
     # Absolute-γ factors, exponents G ≤ 0 so exp ∈ (0,1] — always safe.
-    gamma = jnp.exp(G)      # Eq. 18/30:  γ = exp(G), shared     [N, C, dk]
-    Ebar = gamma * e        # Eq. 20/33:  Ē = γ ⊙ (B ⊙ K)        [N, C, dk]
-    Qg = gamma * q          # Eq. 24/43:  Q_γ = γ ⊙ Q            [N, C, dk]
-    Z = w * v               # Eq. 8, 20/33:  Z = W ⊙ V           [N, C, dv]
+    gamma = jnp.exp(G)  # Eq. 18/30:  γ = exp(G), shared     [N, C, dk]
+    Ebar = gamma * e  # Eq. 20/33:  Ē = γ ⊙ (B ⊙ K)        [N, C, dk]
+    Qg = gamma * q  # Eq. 24/43:  Q_γ = γ ⊙ Q            [N, C, dk]
+    Z = w * v  # Eq. 8, 20/33:  Z = W ⊙ V           [N, C, dv]
 
     # Eqs. 21/34 + 22/34, solved at FULL chunk size C (the sub-chunking only
     # changed how T's entries were produced): one stacked-RHS forward
@@ -942,8 +935,7 @@ def chunkwise_gated_delta_rule_2(
       (O: [B, H, L, dv], S_final: [B, H, dk, dv])
     """
     if core not in _CHUNKWISE_CORES:
-        raise ValueError(
-            f"core={core!r} is not one of {sorted(_CHUNKWISE_CORES)}")
+        raise ValueError(f"core={core!r} is not one of {sorted(_CHUNKWISE_CORES)}")
 
     kwargs = {"chunk_size": chunk_size}
     if core == "subchunking":

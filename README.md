@@ -50,11 +50,44 @@ configs/                   Ready-made experiment YAMLs (see table below)
 tests/                     Numerical verification suite (pytest)
 ```
 
-## Quickstart
+## Reproducible environment
+
+Python 3.12.13 and every direct/transitive dependency are captured by
+`pyproject.toml`, `.python-version`, and the checked-in universal `uv.lock`.
+Install [uv 0.11.29](https://docs.astral.sh/uv/getting-started/installation/)
+(the version pinned in CI), then create the exact CPU development/test environment:
 
 ```bash
-pip install -r requirements.txt        # CPU; on GPU: pip install -U "jax[cuda12]"
+uv sync --frozen
+uv run --frozen pytest -m "not multi_device"
+uv run --frozen ruff check .
+uv run --frozen ruff format --check .
+uv run --frozen pyright
 ```
+
+`requirements.txt` remains an unpinned compatibility input for pip users; it is
+not the reproducible installation path.
+
+### NVIDIA CUDA environment
+
+JAX's prebuilt NVIDIA wheels are Linux-only (native Windows GPU is unsupported;
+WSL2 support is experimental). The lock contains mutually exclusive CUDA 12 and
+CUDA 13 overlays, while the default sync remains CPU-only:
+
+```bash
+# Recommended for a sufficiently recent Linux driver (CUDA 13 requires >= 580):
+uv sync --frozen --extra cuda13
+
+# Older supported Linux drivers / hosted environments (CUDA 12 requires >= 525):
+uv sync --frozen --extra cuda12
+
+# Repeat the selected extra when uv checks/runs the environment:
+uv run --frozen --extra cuda13 python -c "import jax; print(jax.devices())"
+```
+
+Do not enable both CUDA extras together. uv rejects that combination explicitly.
+
+## Quickstart
 
 Fully offline smoke run (synthetic bytes, laptop CPU, minutes):
 
@@ -119,9 +152,23 @@ cache. Lower-level streaming: `model.init_cache(...)` + `model.step(...)`.
 ## Tests
 
 ```bash
-pip install pytest
-JAX_PLATFORMS=cpu python -m pytest tests/    # ~2 min on CPU
+uv run --frozen pytest -m "not multi_device"    # several minutes on CPU
+
+# Exercise the real shard_map training step over two logical CPU devices:
+JAX_PLATFORMS=cpu XLA_FLAGS=--xla_force_host_platform_device_count=2 \
+  uv run --frozen pytest -m multi_device tests/test_data_parallel.py -v
 ```
+
+On PowerShell, set the two-device variables with
+`$env:JAX_PLATFORMS='cpu'` and
+`$env:XLA_FLAGS='--xla_force_host_platform_device_count=2'` before the test.
+GitHub Actions runs formatting, linting, Pyright, the regular CPU suite, and the
+two-device smoke test on every push and pull request.
+
+To intentionally refresh dependency versions, run `uv lock --upgrade`, execute
+the complete check suite above, and commit the resulting `uv.lock` change with
+the compatibility fixes it required. Normal development and CI should keep using
+`--frozen` so dependency releases cannot change a run implicitly.
 
 The suite verifies the numerics the docstrings promise: every chunkwise GDN-2
 core against a token-by-token scan **and** an independent float64 oracle

@@ -24,9 +24,16 @@ B, L = 2, 80  # L = 5 chunks; step() below also exercises ragged tails
 
 def make_layer(num_v_heads=None, chunk_size=CHUNK, core="centered"):
     return GatedDeltaNet2(
-        d_model=D_MODEL, num_heads=HEADS, head_k_dim=DK, head_v_dim=DV,
-        num_v_heads=num_v_heads, chunk_size=chunk_size, conv_size=4,
-        expanded_erase=True, core=core, rngs=nnx.Rngs(0),
+        d_model=D_MODEL,
+        num_heads=HEADS,
+        head_k_dim=DK,
+        head_v_dim=DV,
+        num_v_heads=num_v_heads,
+        chunk_size=chunk_size,
+        conv_size=4,
+        expanded_erase=True,
+        core=core,
+        rngs=nnx.Rngs(0),
     )
 
 
@@ -52,20 +59,22 @@ def test_gqa_folding_equals_repeat_formulation():
 
     # Rebuild the projected tensors, then run the REPEAT formulation manually.
     q, k, v, g, b, w, _ = layer._project(x, conv_states=None)
+
     # Un-group v, w: [B, H, L, G*dv] -> [B, Hv, L, dv] with the G group members
     # of key head h at value heads h*G..h*G+G-1 (matching _split_v's layout).
     def ungroup(t):
-        return (t.reshape(B, HEADS, L, G, DV).transpose(0, 1, 3, 2, 4)
-                 .reshape(B, HEADS * G, L, DV))
+        return t.reshape(B, HEADS, L, G, DV).transpose(0, 1, 3, 2, 4).reshape(B, HEADS * G, L, DV)
+
     v_r, w_r = ungroup(v), ungroup(w)
     rep = lambda t: jnp.repeat(t, G, axis=1)  # noqa: E731  key-side repeat
     S0 = jnp.zeros((B, HEADS * G, DK, DV))
     o_rep, _ = chunkwise_gated_delta_rule_2(
-        rep(q), rep(k), v_r, rep(g), rep(b), w_r, S0,
-        chunk_size=CHUNK, core=layer.core)
+        rep(q), rep(k), v_r, rep(g), rep(b), w_r, S0, chunk_size=CHUNK, core=layer.core
+    )
     # Regroup the per-value-head outputs into the layout _output expects.
-    o_grouped = (o_rep.reshape(B, HEADS, G, L, DV).transpose(0, 1, 3, 2, 4)
-                      .reshape(B, HEADS, L, G * DV))
+    o_grouped = (
+        o_rep.reshape(B, HEADS, G, L, DV).transpose(0, 1, 3, 2, 4).reshape(B, HEADS, L, G * DV)
+    )
     out_repeat = layer._output(o_grouped, x)
     np.testing.assert_allclose(out_folded, out_repeat, rtol=2e-4, atol=2e-4)
 
@@ -105,5 +114,4 @@ def test_initial_state_segment_chaining():
     _, cache = layer.step(x[:, :L], cache)
     np.testing.assert_allclose(cache.recurrent_state, S, rtol=2e-4, atol=2e-4)
     out2, _ = layer.step(x[:, L:], cache)
-    np.testing.assert_allclose(
-        jnp.concatenate([out1, out2], axis=1), full, rtol=2e-4, atol=2e-4)
+    np.testing.assert_allclose(jnp.concatenate([out1, out2], axis=1), full, rtol=2e-4, atol=2e-4)

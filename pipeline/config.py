@@ -124,8 +124,7 @@ class ExperimentConfig:
             )
         if L > self.model.max_seq_len:
             raise ValueError(
-                f"data.seq_len ({L}) exceeds model.max_seq_len "
-                f"({self.model.max_seq_len})."
+                f"data.seq_len ({L}) exceeds model.max_seq_len ({self.model.max_seq_len})."
             )
         if self.data.source not in {"huggingface", "synthetic"}:
             raise ValueError("data.source must be 'huggingface' or 'synthetic'")
@@ -144,8 +143,7 @@ class ExperimentConfig:
             and self.data.num_val_docs is None
         ):
             raise ValueError(
-                "data.num_val_docs must be finite when validation is carved from "
-                "the training split"
+                "data.num_val_docs must be finite when validation is carved from the training split"
             )
         if self.data.source == "synthetic":
             if self.data.synthetic_train_tokens <= L:
@@ -179,7 +177,7 @@ class ExperimentConfig:
             raise ValueError("train.beta1 and beta2 must be in [0, 1)")
 
     @classmethod
-    def load(cls, path: str | Path) -> "ExperimentConfig":
+    def load(cls, path: str | Path) -> ExperimentConfig:
         raw: dict[str, Any] = yaml.safe_load(Path(path).read_text()) or {}
         if not isinstance(raw, dict):
             raise ValueError("The experiment YAML must contain a top-level mapping")

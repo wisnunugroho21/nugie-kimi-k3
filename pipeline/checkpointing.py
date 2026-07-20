@@ -29,6 +29,7 @@ WHY A MANAGER
 from __future__ import annotations
 
 import os
+from typing import Any
 
 import flax.nnx as nnx
 import grain
@@ -44,21 +45,37 @@ class CheckpointManager:
         options = ocp.CheckpointManagerOptions(max_to_keep=keep, create=True)
         self.mgr = ocp.CheckpointManager(self.directory, options=options)
 
-    def save(self, step: int, *, model: nnx.Module, optimizer: nnx.Optimizer,
-             rngs: nnx.Rngs, train_iterator) -> None:
+    def save(
+        self,
+        step: int,
+        *,
+        model: nnx.Module,
+        optimizer: nnx.Optimizer,
+        rngs: nnx.Rngs,
+        train_iterator,
+    ) -> None:
         """Persist model/optimizer/rngs/step/train_iterator at `step` (async; commits
         in the background — call `wait_until_finished` before relying on it on disk)."""
-        self.mgr.save(step, args=ocp.args.Composite(
-            model=ocp.args.StandardSave(nnx.state(model)),
-            optimizer=ocp.args.StandardSave(nnx.state(optimizer)),
-            rngs=ocp.args.StandardSave(nnx.state(rngs)),
-            step=ocp.args.JsonSave(step),
-            train_iterator=grain.checkpoint.CheckpointSave(train_iterator),
-        ))
+        self.mgr.save(
+            step,
+            args=ocp.args.Composite(
+                model=ocp.args.StandardSave(nnx.state(model)),
+                optimizer=ocp.args.StandardSave(nnx.state(optimizer)),
+                rngs=ocp.args.StandardSave(nnx.state(rngs)),
+                step=ocp.args.JsonSave({"value": step}),
+                train_iterator=grain.checkpoint.CheckpointSave(train_iterator),
+            ),
+        )
 
-    def restore(self, step: int | None = None, *, model: nnx.Module | None = None,
-                optimizer: nnx.Optimizer | None = None, rngs: nnx.Rngs | None = None,
-                train_iterator=None):
+    def restore(
+        self,
+        step: int | None = None,
+        *,
+        model: nnx.Module | None = None,
+        optimizer: nnx.Optimizer | None = None,
+        rngs: nnx.Rngs | None = None,
+        train_iterator=None,
+    ) -> tuple[int, Any | None]:
         """Restore in place the objects that are passed (each is optional — evaluation
         only needs `model`, resuming needs all of them). Defaults to the latest
         checkpoint. Returns `(step, train_iterator)`, where `train_iterator` is the
@@ -70,7 +87,7 @@ class CheckpointManager:
         # Build the composite restore request from only the items we were handed. Each
         # live object's current state is the abstract target: it fixes the pytree
         # structure, dtypes and (device) sharding the restored arrays are placed into.
-        items = {"step": ocp.args.JsonRestore()}
+        items: dict[str, Any] = {"step": ocp.args.JsonRestore()}
         if model is not None:
             items["model"] = ocp.args.StandardRestore(nnx.state(model))
         if optimizer is not None:
@@ -88,7 +105,12 @@ class CheckpointManager:
             nnx.update(optimizer, restored["optimizer"])
         if rngs is not None:
             nnx.update(rngs, restored["rngs"])
-        return restored["step"], restored.get("train_iterator")
+        restored_step = restored["step"]
+        # Older checkpoints stored the scalar directly; retain read compatibility
+        # while new checkpoints follow JsonSave's mapping-shaped contract.
+        if isinstance(restored_step, dict):
+            restored_step = restored_step["value"]
+        return int(restored_step), restored.get("train_iterator")
 
     def latest_step(self) -> int | None:
         """Return the newest checkpoint step, or None when the directory is empty."""

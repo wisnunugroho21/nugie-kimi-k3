@@ -111,6 +111,7 @@ class RMSNorm(nnx.Module):
         # promote the result right back to fp32 and waste the cast.
         return (xf * rms * self.weight[...]).astype(x.dtype)
 
+
 class LowRankLinear(nnx.Module):
     """y = W_up(W_down x). The W↑(W↓·) factorization Kimi Linear uses for its
     output gate and decay, kept at rank = head dim for parameter parity."""
@@ -124,16 +125,13 @@ class LowRankLinear(nnx.Module):
         use_bias: bool = False,
         rngs: nnx.Rngs,
     ):
-        self.down = nnx.Linear(
-            in_features, rank, use_bias=False, kernel_init=_XAVIER, rngs=rngs
-        )
-        self.up = nnx.Linear(
-            rank, out_features, use_bias=use_bias, kernel_init=_XAVIER, rngs=rngs
-        )
+        self.down = nnx.Linear(in_features, rank, use_bias=False, kernel_init=_XAVIER, rngs=rngs)
+        self.up = nnx.Linear(rank, out_features, use_bias=use_bias, kernel_init=_XAVIER, rngs=rngs)
 
     def __call__(self, x: jax.Array) -> jax.Array:
         x = self.down(x)
         return self.up(x)
+
 
 class GatedRMSNorm(nnx.Module):
     """Head-wise RMSNorm of the recurrent output, gated by a LOW-RANK SIGMOID gate.
@@ -165,9 +163,7 @@ class GatedRMSNorm(nnx.Module):
         rngs: nnx.Rngs,
     ):
         self.norm = RMSNorm(head_dim, eps=eps, rngs=rngs)
-        self.gate = LowRankLinear(
-            d_model, gate_rank, inner_dim, use_bias=False, rngs=rngs
-        )
+        self.gate = LowRankLinear(d_model, gate_rank, inner_dim, use_bias=False, rngs=rngs)
 
     def __call__(self, O_heads: jax.Array, x: jax.Array) -> jax.Array:
         """O_heads: [B, L, Hv, dv]   x: [B, L, d_model]  ->  [B, L, Hv*dv]."""
@@ -213,9 +209,7 @@ class ShortConv(nnx.Module):
             rngs=rngs,
         )
 
-    def _apply(
-        self, x: jax.Array, conv_state: jax.Array | None
-    ) -> tuple[jax.Array, jax.Array]:
+    def _apply(self, x: jax.Array, conv_state: jax.Array | None) -> tuple[jax.Array, jax.Array]:
         """Shared conv core. `conv_state` is the previous (kernel_size-1) inputs used
         as left context, or None on the full/training path (pad with zeros == the
         causal left-pad). Returns (y: [B, L, C], new_state: [B, kernel_size-1, C])."""
@@ -564,15 +558,19 @@ class GatedDeltaNet2(nnx.Module):
         q, k, v, g, b, w, _ = self._project(x, conv_states=None)
 
         if initial_state is None:
-            S0 = jnp.zeros(
-                (B, self.H, self.dk, self.group * self.dv), jnp.float32
-            )
+            S0 = jnp.zeros((B, self.H, self.dk, self.group * self.dv), jnp.float32)
         else:
             S0 = self._state_in(initial_state)
 
         # Gated Delta Rule-2 chunkwise core (Eq. 10); forms cumsum γ internally (Eq. 30).
         o, S_final = chunkwise_gated_delta_rule_2(
-            q, k, v, g, b, w, S0,
+            q,
+            k,
+            v,
+            g,
+            b,
+            w,
+            S0,
             chunk_size=self.chunk_size,
             core=self.core,
             sub_chunk_size=self.sub_chunk_size,
@@ -593,9 +591,7 @@ class GatedDeltaNet2(nnx.Module):
     #     prefill: out, cache = layer.step(prompt, layer.init_cache(B, ...))
     #     decode : out, cache = layer.step(one_token, cache)   # repeat
     # ----------------------------------------------------------------------- #
-    def init_cache(
-        self, batch_size: int, max_len: int | None = None, dtype=None
-    ) -> GDN2Cache:
+    def init_cache(self, batch_size: int, max_len: int | None = None, dtype=None) -> GDN2Cache:
         """Empty streaming cache. `max_len` is accepted for interface parity with
         attention caches but UNUSED here — the GDN-2 state is fixed-size,
         independent of sequence length (the point of linear attention).
@@ -612,9 +608,7 @@ class GatedDeltaNet2(nnx.Module):
         kc = self.conv_size - 1
         dtype = self.compute_dtype if dtype is None else dtype
         return GDN2Cache(
-            recurrent_state=jnp.zeros(
-                (batch_size, self.Hv, self.dk, self.dv), jnp.float32
-            ),
+            recurrent_state=jnp.zeros((batch_size, self.Hv, self.dk, self.dv), jnp.float32),
             q_conv=jnp.zeros((batch_size, kc, self.H * self.dk), dtype),
             k_conv=jnp.zeros((batch_size, kc, self.H * self.dk), dtype),
             v_conv=jnp.zeros((batch_size, kc, self.Hv * self.dv), dtype),

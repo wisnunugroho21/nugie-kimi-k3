@@ -115,13 +115,13 @@ def make_optimizer(
         optax.clip_by_global_norm(clip_norm),
         optax.contrib.muon(
             learning_rate=learning_rate,
-            beta=muon_beta,           # Muon momentum (matrices)
+            beta=muon_beta,  # Muon momentum (matrices)
             eps=eps,
             weight_decay=weight_decay,  # decays ONLY the Muon-side matrices
-            adam_weight_decay=0.0,    # embed/head/biases/norms/decays: no decay
+            adam_weight_decay=0.0,  # embed/head/biases/norms/decays: no decay
             adam_b1=adam_b1,
             adam_b2=adam_b2,
-            consistent_rms=0.2,       # Moonlight: match AdamW's update RMS
+            consistent_rms=0.2,  # Moonlight: match AdamW's update RMS
             muon_weight_dimension_numbers=_spec_tree,
         ),
     )
@@ -129,8 +129,8 @@ def make_optimizer(
     if verbose:
         params = nnx.state(model, nnx.Param)
         leaves = jax.tree_util.tree_leaves_with_path(params)
-        n_muon = sum(l.size for p, l in leaves if _muon_spec(p, l) is not None)
-        n_adam = sum(l.size for p, l in leaves if _muon_spec(p, l) is None)
+        n_muon = sum(leaf.size for path, leaf in leaves if _muon_spec(path, leaf) is not None)
+        n_adam = sum(leaf.size for path, leaf in leaves if _muon_spec(path, leaf) is None)
         print(
             f"optimizer: Muon on {n_muon:,} matrix params, "
             f"AdamW on {n_adam:,} others (embed/head/biases/norms/decays)"

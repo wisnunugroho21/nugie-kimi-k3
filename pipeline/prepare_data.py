@@ -87,9 +87,7 @@ def _hf_doc_tokens(docs, tokenizer, text_field: str, dtype: np.dtype):
             print(f"  tokenized {i + 1} docs...", flush=True)
 
 
-def _synthetic_tokens(
-    n_tokens: int, vocab_size: int, eos_id: int, dtype: np.dtype, seed: int
-):
+def _synthetic_tokens(n_tokens: int, vocab_size: int, eos_id: int, dtype: np.dtype, seed: int):
     """Yield random token ids in ~200-token 'documents' ended by EOS. Purely for
     exercising the pipeline without a network or tokenizer download."""
     rng = np.random.default_rng(seed)
@@ -116,16 +114,12 @@ def prepare(cfg: ExperimentConfig) -> None:
         print(f"[synthetic] vocab={vocab_size} dtype={dtype}")
         n_val = _write_stream(
             val_bin,
-            _synthetic_tokens(
-                cfg.data.synthetic_val_tokens, vocab_size, eos_id, dtype, seed=1
-            ),
+            _synthetic_tokens(cfg.data.synthetic_val_tokens, vocab_size, eos_id, dtype, seed=1),
             dtype,
         )
         n_train = _write_stream(
             train_bin,
-            _synthetic_tokens(
-                cfg.data.synthetic_train_tokens, vocab_size, eos_id, dtype, seed=2
-            ),
+            _synthetic_tokens(cfg.data.synthetic_train_tokens, vocab_size, eos_id, dtype, seed=2),
             dtype,
         )
     elif cfg.data.source == "huggingface":

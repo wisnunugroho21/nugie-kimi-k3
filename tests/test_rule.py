@@ -54,8 +54,10 @@ def make_inputs(key, decay_strength: float, batched: bool = False):
     q, k = (jax.random.normal(ks[i], (*shape, L, DK)) for i in (0, 1))
     q = q / jnp.linalg.norm(q, axis=-1, keepdims=True)
     k = k / jnp.linalg.norm(k, axis=-1, keepdims=True)
-    v, w = (jax.random.normal(ks[2], (*shape, L, DV)),
-            jax.nn.sigmoid(jax.random.normal(ks[3], (*shape, L, DV))))
+    v, w = (
+        jax.random.normal(ks[2], (*shape, L, DV)),
+        jax.nn.sigmoid(jax.random.normal(ks[3], (*shape, L, DV))),
+    )
     b = 2.0 * jax.nn.sigmoid(jax.random.normal(ks[4], (*shape, L, DK)))
     g = -decay_strength * jax.random.uniform(ks[5], (*shape, L, DK))
     S0 = 0.1 * jax.random.normal(ks[6], (*shape, DK, DV))
@@ -74,10 +76,10 @@ def test_recurrent_matches_f64_oracle(decay_strength):
 # Per-core decay strengths kept inside each core's documented safe range.
 # mean(|g|) = strength/2, so per-chunk |G_C| ≈ CHUNK * strength / 2.
 CORE_DECAYS = {
-    "faithful": [0.05, 1.0, 4.0],       # |G_C| up to ~64  (< 88 limit)
-    "stacked_rhs": [0.05, 1.0, 4.0],    # same literal factors, same limit
-    "centered": [0.05, 1.0, 9.0],       # |G_C| up to ~144 (< 176 limit)
-    "pairwise": [0.05, 1.0, 9.0, 30.0],     # no limit; 30 -> |G_C| ~ 480
+    "faithful": [0.05, 1.0, 4.0],  # |G_C| up to ~64  (< 88 limit)
+    "stacked_rhs": [0.05, 1.0, 4.0],  # same literal factors, same limit
+    "centered": [0.05, 1.0, 9.0],  # |G_C| up to ~144 (< 176 limit)
+    "pairwise": [0.05, 1.0, 9.0, 30.0],  # no limit; 30 -> |G_C| ~ 480
     "subchunking": [0.05, 1.0, 9.0, 30.0],  # no limit
 }
 
@@ -89,9 +91,16 @@ CORE_DECAYS = {
 def test_chunkwise_cores_match_oracles(core, decay_strength):
     q, k, v, g, b, w, S0 = make_inputs(jax.random.PRNGKey(1), decay_strength)
     o, S = chunkwise_gated_delta_rule_2(
-        q[None, None], k[None, None], v[None, None], g[None, None],
-        b[None, None], w[None, None], S0[None, None],
-        chunk_size=CHUNK, core=core, sub_chunk_size=8,
+        q[None, None],
+        k[None, None],
+        v[None, None],
+        g[None, None],
+        b[None, None],
+        w[None, None],
+        S0[None, None],
+        chunk_size=CHUNK,
+        core=core,
+        sub_chunk_size=8,
     )
     o, S = o[0, 0], S[0, 0]
 
@@ -108,8 +117,16 @@ def test_faithful_overflows_where_pairwise_does_not():
     literal exp(-G) factor overflows (NaN/inf) while pairwise stays finite."""
     q, k, v, g, b, w, S0 = make_inputs(jax.random.PRNGKey(2), 30.0)
     args = lambda core: chunkwise_gated_delta_rule_2(  # noqa: E731
-        q[None, None], k[None, None], v[None, None], g[None, None],
-        b[None, None], w[None, None], S0[None, None], chunk_size=CHUNK, core=core)
+        q[None, None],
+        k[None, None],
+        v[None, None],
+        g[None, None],
+        b[None, None],
+        w[None, None],
+        S0[None, None],
+        chunk_size=CHUNK,
+        core=core,
+    )
     o_faithful, _ = args("faithful")
     o_pairwise, _ = args("pairwise")
     assert not bool(jnp.isfinite(o_faithful).all())
@@ -124,7 +141,8 @@ def test_batched_entry_points_match_single():
     for bi in range(q.shape[0]):
         for h in range(q.shape[1]):
             o1, S1 = _recurrent_single(
-                q[bi, h], k[bi, h], v[bi, h], g[bi, h], b[bi, h], w[bi, h], S0[bi, h])
+                q[bi, h], k[bi, h], v[bi, h], g[bi, h], b[bi, h], w[bi, h], S0[bi, h]
+            )
             np.testing.assert_allclose(o_b[bi, h], o1, rtol=1e-5, atol=1e-5)
             np.testing.assert_allclose(o_c[bi, h], o1, rtol=1e-3, atol=1e-3)
             np.testing.assert_allclose(S_b[bi, h], S1, rtol=1e-5, atol=1e-5)
@@ -134,13 +152,27 @@ def test_chunk_size_must_divide_length():
     q, k, v, g, b, w, S0 = make_inputs(jax.random.PRNGKey(4), 1.0)
     with pytest.raises(ValueError, match="chunk_size"):
         chunkwise_gated_delta_rule_2(
-            q[None, None], k[None, None], v[None, None], g[None, None],
-            b[None, None], w[None, None], S0[None, None], chunk_size=48)
+            q[None, None],
+            k[None, None],
+            v[None, None],
+            g[None, None],
+            b[None, None],
+            w[None, None],
+            S0[None, None],
+            chunk_size=48,
+        )
 
 
 def test_unknown_core_rejected():
     q, k, v, g, b, w, S0 = make_inputs(jax.random.PRNGKey(5), 1.0)
     with pytest.raises(ValueError, match="core"):
         chunkwise_gated_delta_rule_2(
-            q[None, None], k[None, None], v[None, None], g[None, None],
-            b[None, None], w[None, None], S0[None, None], core="nope")
+            q[None, None],
+            k[None, None],
+            v[None, None],
+            g[None, None],
+            b[None, None],
+            w[None, None],
+            S0[None, None],
+            core="nope",
+        )

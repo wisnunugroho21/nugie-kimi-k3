@@ -1,4 +1,6 @@
-# Core JAX stack (install the CUDA build of jax on GPU: pip install -U "jax[cuda12]")
+# Legacy, unpinned pip input. For reproducible CPU/CUDA environments use
+# `uv sync --frozen` and the checked-in uv.lock as documented in README.md.
+# Core JAX stack
 jax>=0.6
 flax>=0.11              # nnx.Optimizer(model, tx, wrt=...) and update(model, grads)
 optax>=0.2.7            # contrib.muon with MuonDimensionNumbers + consistent_rms; tested on 0.2.8

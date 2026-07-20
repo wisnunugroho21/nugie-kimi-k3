@@ -226,17 +226,13 @@ class GroupedQueryLatentAttention(nnx.Module):
 
         # Softmax over the key axis -> per-query attention distribution (fp32), then
         # back to the compute dtype for the (bf16) weighted-sum matmul below.
-        a = jax.nn.softmax(scaled_logits, axis=-1).astype(
-            l_kv_repeated.dtype
-        )  # (B, Hq, T, T)
+        a = jax.nn.softmax(scaled_logits, axis=-1).astype(l_kv_repeated.dtype)  # (B, Hq, T, T)
 
         # --- Weighted sum of value-latents ---
         # 'k' is shared between the weights and the value positions, so it is the
         # contracted axis (the actual attention sum); 'd' is the kept feature dim.
         # Because keys and values are the same latent, l_kv_repeated reappears here.
-        weighted_heads = jnp.einsum(
-            "bhqk, bhkd -> bhqd", a, l_kv_repeated
-        )  # (B, Hq, T, Dh)
+        weighted_heads = jnp.einsum("bhqk, bhkd -> bhqd", a, l_kv_repeated)  # (B, Hq, T, Dh)
 
         # Move head axis back and flatten heads: (B, T, Hq, Dh) -> (B, T, Hq*Dh)
         weighted_reshaped = weighted_heads.swapaxes(1, 2)
@@ -288,15 +284,18 @@ class GroupedQueryLatentAttention(nnx.Module):
             raise ValueError("x batch size does not match the MLA cache")
         expected_width = self.num_kv_heads * self.head_dim
         if cache.l_kv.shape[2] != expected_width:
-            raise ValueError(
-                f"MLA cache width must be {expected_width}, got {cache.l_kv.shape[2]}"
-            )
+            raise ValueError(f"MLA cache width must be {expected_width}, got {cache.l_kv.shape[2]}")
         # Outside a transformed/JIT context the position is concrete, so fail
         # loudly instead of relying on dynamic_update_slice's clamping behavior.
         # generate() performs the same capacity check before entering its jitted
         # decode loop.
-        if not isinstance(cache.pos, jax.core.Tracer):
+        try:
             pos = int(cache.pos)
+        except jax.errors.ConcretizationTypeError:
+            # A traced position cannot be converted to a Python int. Capacity is
+            # validated by generate() before its jitted decode loop instead.
+            pass
+        else:
             if pos + L > max_len:
                 raise ValueError(
                     f"MLA cache capacity exceeded: pos={pos}, chunk={L}, max_len={max_len}"
@@ -315,18 +314,18 @@ class GroupedQueryLatentAttention(nnx.Module):
         )
 
         # --- Shared KV latent (serves as both keys and values) ---
-        l_kv_heads = l_kv.reshape(
-            B, max_len, self.num_kv_heads, self.head_dim
-        ).swapaxes(1, 2)  # (B, Hkv, max_len, Dh)
+        l_kv_heads = l_kv.reshape(B, max_len, self.num_kv_heads, self.head_dim).swapaxes(
+            1, 2
+        )  # (B, Hkv, max_len, Dh)
         l_kv_rep = l_kv_heads.repeat(self.group_size, axis=1)  # (B, Hq, max_len, Dh)
 
         # Scores: the L new queries attend over all max_len cached slots. Upcast to
         # fp32 for the mask/softmax exactly as the training __call__ path does — the
         # projections may run in bf16, but the attention distribution must be built
         # in fp32 so prefill/decode stay numerically consistent with training.
-        logits = jnp.einsum("bhqd, bhkd -> bhqk", q_heads, l_kv_rep).astype(
-            F32
-        ) / jnp.sqrt(self.head_dim)
+        logits = jnp.einsum("bhqd, bhkd -> bhqk", q_heads, l_kv_rep).astype(F32) / jnp.sqrt(
+            self.head_dim
+        )
 
         # Causal mask offset by the cache position: query i sits at absolute position
         # pos+i and may attend to slot j iff j <= pos+i.  This also masks the not-yet-
@@ -342,9 +341,7 @@ class GroupedQueryLatentAttention(nnx.Module):
 
         # Weighted sum of value-latents: the same latent serves as both K and V.
         weighted = jnp.einsum("bhqk, bhkd -> bhqd", a, l_kv_rep)  # (B, Hq, L, Dh)
-        weighted = weighted.swapaxes(1, 2).reshape(
-            B, L, self.num_q_heads * self.head_dim
-        )
+        weighted = weighted.swapaxes(1, 2).reshape(B, L, self.num_q_heads * self.head_dim)
 
         # Gated MLA (K3): same sigmoid gate as the training path. The gate
         # depends only on the CURRENT positions' x — never on past positions —

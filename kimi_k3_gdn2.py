@@ -86,11 +86,11 @@ TWO FORWARD MODES
 from __future__ import annotations
 
 import dataclasses
+from typing import cast
 
 import flax.nnx as nnx
 import jax
 import jax.numpy as jnp
-from jax.typing import ArrayLike
 
 # Reuse the building blocks already implemented and verified in this repo.
 from gated_deltanet_2.layer import GatedDeltaNet2, GDN2Cache, RMSNorm
@@ -242,7 +242,9 @@ class KimiK3Config:
                 raise ValueError("gdn_num_v_heads must be a multiple of gdn_num_heads")
         valid_cores = {"faithful", "stacked_rhs", "centered", "subchunking", "pairwise"}
         if self.gdn_core not in valid_cores:
-            raise ValueError(f"gdn_core must be one of {sorted(valid_cores)}, got {self.gdn_core!r}")
+            raise ValueError(
+                f"gdn_core must be one of {sorted(valid_cores)}, got {self.gdn_core!r}"
+            )
         if self.gdn_core == "subchunking" and self.gdn_chunk_size % self.gdn_sub_chunk_size:
             raise ValueError("gdn_sub_chunk_size must divide gdn_chunk_size for subchunking")
         if self.mla_num_q_heads % self.mla_num_kv_heads:
@@ -288,9 +290,7 @@ class AttnResOp(nnx.Module):
         self.query = nnx.Param(jnp.zeros((d_model,), jnp.float32))  # w_l (§5: zero)
         self.norm = RMSNorm(d_model, eps=eps, rngs=rngs)
 
-    def __call__(
-        self, blocks: list[jax.Array], partial: jax.Array | None
-    ) -> jax.Array:
+    def __call__(self, blocks: list[jax.Array], partial: jax.Array | None) -> jax.Array:
         """blocks: completed block reps [b_0(embedding), b_1, ...], each [B, L, d];
         partial: the intra-block partial sum b_n^i, or None at a block start
         (Eq. 6: the first layer of a block sees only the completed blocks).
@@ -425,7 +425,9 @@ class DecoderLayer(nnx.Module):
         h = self._mix_in("attn_res_mixer", blocks, partial)
         blocks, partial = self._seal_block(blocks, partial)
 
-        out = self.token_mixer(self.norm1(h))
+        # GatedDeltaNet2's public return type also covers return_state=True, but
+        # DecoderLayer always uses the default array-only path here.
+        out = cast(jax.Array, self.token_mixer(self.norm1(h)))
         partial = out if partial is None else partial + out
 
         # --- channel mixing (AttnRes input, pre-norm sub-layer) ---
@@ -455,9 +457,7 @@ class DecoderLayer(nnx.Module):
         blocks, partial = self._seal_block(blocks, partial)
 
         hn = self.norm1(h)
-        if isinstance(cache, GDN2Cache) and isinstance(
-            self.token_mixer, GatedDeltaNet2
-        ):
+        if isinstance(cache, GDN2Cache) and isinstance(self.token_mixer, GatedDeltaNet2):
             # GDN-2: fixed-size recurrent state (O(1) per token).
             out, new_cache = self.token_mixer.step(hn, cache)
         elif isinstance(cache, MLACache) and isinstance(
@@ -488,15 +488,11 @@ class KimiK3(nnx.Module):
     def __init__(self, cfg: KimiK3Config, *, rngs: nnx.Rngs):
         self.cfg = cfg
         # Token embedding table.
-        self.embed = nnx.Embed(
-            cfg.vocab_size, cfg.d_model, embedding_init=_XAVIER, rngs=rngs
-        )
+        self.embed = nnx.Embed(cfg.vocab_size, cfg.d_model, embedding_init=_XAVIER, rngs=rngs)
 
         # Stack of decoder blocks. NOTE: in Flax NNX a plain Python list of submodules
         # is not tracked as state — it must be wrapped in nnx.List(...).
-        self.layers = nnx.List(
-            [DecoderLayer(cfg, i, rngs=rngs) for i in range(cfg.n_layers)]
-        )
+        self.layers = nnx.List([DecoderLayer(cfg, i, rngs=rngs) for i in range(cfg.n_layers)])
 
         # Final AttnRes aggregation over all block representations (paper §3.2:
         # "the final output layer aggregates all N block representations"),
@@ -516,7 +512,7 @@ class KimiK3(nnx.Module):
             rngs=rngs,
         )
 
-    def __call__(self, input_ids: jax.Array) -> tuple[jax.Array, dict[str, ArrayLike]]:
+    def __call__(self, input_ids: jax.Array) -> tuple[jax.Array, dict[str, jax.Array]]:
         """input_ids: int[B, L] -> (logits[B, L, vocab], aux).
 
         aux is ALWAYS returned (callers that don't need it just unpack `logits, _ =`):
@@ -527,10 +523,8 @@ class KimiK3(nnx.Module):
         """
         if input_ids.ndim != 2 or input_ids.shape[0] == 0 or input_ids.shape[1] == 0:
             raise ValueError("input_ids must have shape [B, L] with B > 0 and L > 0")
-        aux_loss: ArrayLike = 0.0
-        group_sizes: list[
-            ArrayLike
-        ] = []  # one [E] vector per MoE layer, in layer order
+        aux_loss = jnp.array(0.0, jnp.float32)
+        group_sizes: list[jax.Array] = []  # one [E] vector per MoE layer, in layer order
 
         # Block AttnRes state: blocks[0] is ALWAYS the token embedding (the
         # paper's b_0), and the intra-block partial sum starts empty.
@@ -555,9 +549,7 @@ class KimiK3(nnx.Module):
 
         return logits, {"aux_loss": aux_loss, "group_sizes": jnp.stack(group_sizes)}
 
-    def _final_mix(
-        self, blocks: list[jax.Array], partial: jax.Array | None
-    ) -> jax.Array:
+    def _final_mix(self, blocks: list[jax.Array], partial: jax.Array | None) -> jax.Array:
         """Pre-head aggregation: the final AttnRes op over every depth-wise
         source, or their plain sum (= the classic residual stream) without it."""
         if self.cfg.attn_res:
@@ -574,9 +566,7 @@ class KimiK3(nnx.Module):
     #  AttnRes carries NOTHING across steps — depth-wise mixing is recomputed for
     #  each new position from that position's own layer outputs.
     # ----------------------------------------------------------------------- #
-    def init_cache(
-        self, batch_size: int, max_len: int | None = None, dtype=None
-    ) -> list:
+    def init_cache(self, batch_size: int, max_len: int | None = None, dtype=None) -> list:
         """Streaming caches for every layer. `max_len` (default cfg.max_seq_len) sizes
         the MLA latent buffers; GDN-2 layers ignore it (their state is fixed-size).
         `dtype` overrides every cache's buffer dtype; None (default) lets each
@@ -594,20 +584,16 @@ class KimiK3(nnx.Module):
         """One streaming step. input_ids: int[B, L] (L = prompt length on prefill, or
         1 per decoded token). Returns (logits[B, L, vocab], new_caches)."""
         if input_ids.ndim != 2 or input_ids.shape[0] == 0 or input_ids.shape[1] == 0:
-            raise ValueError(
-                "input_ids must have shape [batch, length] with both axes non-empty"
-            )
+            raise ValueError("input_ids must have shape [batch, length] with both axes non-empty")
         if len(caches) != len(self.layers):
-            raise ValueError(
-                f"Expected {len(self.layers)} layer caches, received {len(caches)}"
-            )
+            raise ValueError(f"Expected {len(self.layers)} layer caches, received {len(caches)}")
         new_caches = []
 
         emb = self.embed(input_ids)
         blocks: list[jax.Array] = [emb]
         partial: jax.Array | None = None
 
-        for layer, cache in zip(self.layers, caches):
+        for layer, cache in zip(self.layers, caches, strict=True):
             blocks, partial, new_cache = layer.step(blocks, partial, cache)
             new_caches.append(new_cache)
 
@@ -684,6 +670,8 @@ class KimiK3(nnx.Module):
         done = jnp.zeros((B,), bool)
         for i in range(max_new_tokens):
             if temperature > 0.0:
+                if key is None:  # guarded above; keeps the invariant explicit to type checkers
+                    raise RuntimeError("sampling key unexpectedly missing")
                 key, sub = jax.random.split(key)
                 next_tok = _sample_token(step_logits, sub, temperature, top_p)
             else:
@@ -736,9 +724,7 @@ def _layer_forward_remat(
 #  object, so a wrapper created inside generate() would recompile every call.
 # --------------------------------------------------------------------------- #
 @nnx.jit
-def _decode_step(
-    model: KimiK3, tok: jax.Array, caches: list
-) -> tuple[jax.Array, list]:
+def _decode_step(model: KimiK3, tok: jax.Array, caches: list) -> tuple[jax.Array, list]:
     """One decode step: tok int[B, 1] -> (last-position logits f32[B, vocab], caches).
     Token selection (argmax / sampling) happens in generate(), outside this trace."""
     logits, caches = model.step(tok, caches)

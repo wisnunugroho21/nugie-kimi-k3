@@ -37,19 +37,28 @@ Run:  python -m pipeline.train --config configs/tiny.yaml [--resume]
 from __future__ import annotations
 
 import argparse
+
+# `shard_map` became a top-level `jax.shard_map` in recent JAX; fall back to its
+# experimental location on older releases.
+import inspect
 import math
 import time
+from typing import Any, cast
 
 import flax.nnx as nnx
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
-from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+from jax.sharding import Mesh, NamedSharding
+from jax.sharding import PartitionSpec as P
 
-# `shard_map` became a top-level `jax.shard_map` in recent JAX; fall back to its
-# experimental location on older releases.
-import inspect
+from kimi_k3_gdn2 import KimiK3, count_params
+from multi_latent_attention.moe import update_router_bias
+from pipeline import data as data_mod
+from pipeline.checkpointing import CheckpointManager
+from pipeline.config import ExperimentConfig
+from pipeline.optimizer import make_optimizer
 
 try:
     from jax import shard_map as _shard_map_impl
@@ -61,21 +70,15 @@ except ImportError:  # pragma: no cover
 # the checker rejects (scan-vma). We own out_specs correctness explicitly via the
 # pmean/psum collectives below, so turning the check off is safe. The kwarg was renamed
 # check_rep -> check_vma across JAX versions; pick whichever this build exposes.
-_CHECK_KW = ("check_vma" if "check_vma" in inspect.signature(_shard_map_impl).parameters
-             else "check_rep")
+_CHECK_KW = (
+    "check_vma" if "check_vma" in inspect.signature(_shard_map_impl).parameters else "check_rep"
+)
 
 
 def shard_map(f, **kwargs):
     """Call the installed JAX shard_map variant with its VMA check disabled."""
-    return _shard_map_impl(f, **kwargs, **{_CHECK_KW: False})
-
-
-from kimi_k3_gdn2 import KimiK3, count_params
-from multi_latent_attention.moe import update_router_bias
-from pipeline import data as data_mod
-from pipeline.checkpointing import CheckpointManager
-from pipeline.config import ExperimentConfig
-from pipeline.optimizer import make_optimizer
+    impl = cast(Any, _shard_map_impl)
+    return impl(f, **kwargs, **{_CHECK_KW: False})
 
 
 # --------------------------------------------------------------------------- #
@@ -120,8 +123,7 @@ def build_optimizer(model: KimiK3, cfg: ExperimentConfig) -> nnx.Optimizer:
 def loss_fn(model: KimiK3, batch: dict[str, jax.Array]):
     """Returns (total_loss, (ce_loss, aux_loss, group_sizes)). total = CE + MoE aux."""
     logits, aux = model(batch["input_ids"])  # logits fp32 [B,L,V]
-    ce = optax.softmax_cross_entropy_with_integer_labels(
-        logits, batch["target_ids"]).mean()
+    ce = optax.softmax_cross_entropy_with_integer_labels(logits, batch["target_ids"]).mean()
     total = ce + aux["aux_loss"]
     return total, (ce, aux["aux_loss"], aux["group_sizes"])
 
@@ -150,16 +152,19 @@ def make_train_step(mesh: Mesh):
     """
 
     @nnx.jit
-    def train_step(model: KimiK3, optimizer: nnx.Optimizer,
-                   batch: dict[str, jax.Array], router_bias_lr: float):
+    def train_step(
+        model: KimiK3, optimizer: nnx.Optimizer, batch: dict[str, jax.Array], router_bias_lr: float
+    ):
         graphdef, params, rest = nnx.split(model, *_PARAM_FILTER)
 
         def _dp(params, rest, batch):
             # Per-device forward/backward over this shard's local tokens.
             def _loss(p):
                 return loss_fn(nnx.merge(graphdef, p, rest), batch)
-            (total, (ce, aux_loss, group_sizes)), grads = jax.value_and_grad(
-                _loss, has_aux=True)(params)
+
+            (total, (ce, aux_loss, group_sizes)), grads = jax.value_and_grad(_loss, has_aux=True)(
+                params
+            )
             # Re-sync replicas: average grads/loss, SUM the per-expert counts so the
             # router-bias update sees the global batch's load (not one shard's).
             grads = jax.lax.pmean(grads, "data")
@@ -170,8 +175,9 @@ def make_train_step(mesh: Mesh):
             return grads, total, ce, aux_loss, group_sizes
 
         grads, total, ce, aux_loss, group_sizes = shard_map(
-            _dp, mesh=mesh,
-            in_specs=(P(), P(), P("data")),      # params/rest replicated; batch sharded
+            _dp,
+            mesh=mesh,
+            in_specs=(P(), P(), P("data")),  # params/rest replicated; batch sharded
             out_specs=(P(), P(), P(), P(), P()),  # all outputs already replica-reduced
         )(params, rest, batch)
 
@@ -181,8 +187,7 @@ def make_train_step(mesh: Mesh):
         for i, layer in enumerate(model.layers):
             moe = layer.channel_mixer
             moe.router_bias.set_value(
-                update_router_bias(
-                    moe.router_bias.get_value(), group_sizes[i], router_bias_lr)
+                update_router_bias(moe.router_bias.get_value(), group_sizes[i], router_bias_lr)
             )
 
         return total, ce, aux_loss
@@ -202,13 +207,15 @@ def make_eval_step(mesh: Mesh):
         def _fwd(params, rest, batch):
             logits, _ = nnx.merge(graphdef, params, rest)(batch["input_ids"])
             tok_ce = optax.softmax_cross_entropy_with_integer_labels(
-                logits, batch["target_ids"])  # [B_local, L]
+                logits, batch["target_ids"]
+            )  # [B_local, L]
             ce_sum = jax.lax.psum(tok_ce.sum(), "data")
             n = jax.lax.psum(jnp.array(tok_ce.size, jnp.float32), "data")
             return ce_sum, n
 
         return shard_map(
-            _fwd, mesh=mesh,
+            _fwd,
+            mesh=mesh,
             in_specs=(P(), P(), P("data")),
             out_specs=(P(), P()),
         )(params, rest, batch)
@@ -216,8 +223,7 @@ def make_eval_step(mesh: Mesh):
     return eval_step
 
 
-def evaluate_loss(model: KimiK3, eval_step, val_iter, steps: int,
-                  shard=None) -> dict[str, float]:
+def evaluate_loss(model: KimiK3, eval_step, val_iter, steps: int, shard=None) -> dict[str, float]:
     """Mean CE / perplexity over `steps` val batches. Sets the model to eval mode so
     any train-only behavior is disabled (harmless here; good hygiene). `shard`, if
     given, places each batch on the data-parallel sharding used by the params."""
@@ -257,11 +263,18 @@ def train(cfg: ExperimentConfig, resume: bool = False) -> None:
     if meta["vocab_size"] != cfg.model.vocab_size:
         raise ValueError(
             f"model.vocab_size ({cfg.model.vocab_size}) != tokenized vocab "
-            f"({meta['vocab_size']}). Fix the YAML so they match.")
+            f"({meta['vocab_size']}). Fix the YAML so they match."
+        )
     train_iter = data_mod.make_loader(
-        cfg.data.data_dir, "train", cfg.data.seq_len, tc.batch_size,
-        shuffle=True, repeat=True, seed=cfg.data.shuffle_buffer_seed,
-        num_workers=cfg.data.num_workers)
+        cfg.data.data_dir,
+        "train",
+        cfg.data.seq_len,
+        tc.batch_size,
+        shuffle=True,
+        repeat=True,
+        seed=cfg.data.shuffle_buffer_seed,
+        num_workers=cfg.data.num_workers,
+    )
 
     def make_val_iter():
         # Rebuilt for EVERY in-training eval so each one measures the same
@@ -269,8 +282,15 @@ def train(cfg: ExperimentConfig, resume: bool = False) -> None:
         # repeating iterator would give every eval a different window,
         # adding data noise to the val-loss curve that isn't model noise.
         return data_mod.make_loader(
-            cfg.data.data_dir, "val", cfg.data.seq_len, tc.batch_size,
-            shuffle=False, repeat=True, seed=0, num_workers=0)
+            cfg.data.data_dir,
+            "val",
+            cfg.data.seq_len,
+            tc.batch_size,
+            shuffle=False,
+            repeat=True,
+            seed=0,
+            num_workers=0,
+        )
 
     # --- model + optimizer ---
     # Keep the Rngs object around (not just the seed): it is checkpointed alongside
@@ -278,8 +298,10 @@ def train(cfg: ExperimentConfig, resume: bool = False) -> None:
     rngs = nnx.Rngs(tc.seed)
     model = build_model(cfg, rngs)
     optimizer = build_optimizer(model, cfg)
-    print(f"Model params: {count_params(model):,}  "
-          f"(compute_dtype={cfg.model.compute_dtype}, seq_len={cfg.data.seq_len})")
+    print(
+        f"Model params: {count_params(model):,}  "
+        f"(compute_dtype={cfg.model.compute_dtype}, seq_len={cfg.data.seq_len})"
+    )
 
     # --- data-parallel sharding (works for 1 device too) ---
     devices = jax.devices()
@@ -287,14 +309,15 @@ def train(cfg: ExperimentConfig, resume: bool = False) -> None:
     if tc.batch_size % n_dev != 0:
         raise ValueError(
             f"batch_size ({tc.batch_size}) must be divisible by the number of "
-            f"devices ({n_dev}) for data-parallel training.")
+            f"devices ({n_dev}) for data-parallel training."
+        )
     # Manual (shard_map) data parallelism: one "data" axis over all devices. train/eval
     # steps run the model forward INSIDE shard_map so the MoE's global token dispatch
     # stays device-local (GSPMD auto-partitioning would all-gather it onto one GPU —
     # collapsing the second device and OOMing the batch). See make_train_step.
     mesh = Mesh(np.asarray(devices), ("data",))
     data_shard = NamedSharding(mesh, P("data"))  # split batch across devices
-    repl_shard = NamedSharding(mesh, P())        # replicate params/opt state
+    repl_shard = NamedSharding(mesh, P())  # replicate params/opt state
     # Replicate the model params, optimizer state, and RNG stream across
     # all devices. (In this Flax version nnx.Optimizer does NOT nest the model, so the
     # two must be replicated explicitly.) This also fixes the sharding of the abstract
@@ -305,8 +328,7 @@ def train(cfg: ExperimentConfig, resume: bool = False) -> None:
     train_step = make_train_step(mesh)
     eval_step = make_eval_step(mesh)
     if n_dev > 1:
-        print(f"Data-parallel over {n_dev} devices "
-              f"({tc.batch_size // n_dev} examples/device).")
+        print(f"Data-parallel over {n_dev} devices ({tc.batch_size // n_dev} examples/device).")
 
     # --- checkpoint manager (+ optional resume) ---
     ckpt = CheckpointManager(tc.ckpt_dir, keep=tc.keep_checkpoints)
@@ -319,8 +341,12 @@ def train(cfg: ExperimentConfig, resume: bool = False) -> None:
             "--resume or choose a different train.ckpt_dir."
         )
     if resume and latest_step is not None:
-        restored_step, train_iter = ckpt.restore(
-            model=model, optimizer=optimizer, rngs=rngs, train_iterator=train_iter)
+        restored_step, restored_iter = ckpt.restore(
+            model=model, optimizer=optimizer, rngs=rngs, train_iterator=train_iter
+        )
+        if restored_iter is None:
+            raise RuntimeError("checkpoint did not restore the requested training iterator")
+        train_iter = restored_iter
         start_step = restored_step + 1
         print(f"Resumed from step {restored_step}")
         if start_step >= tc.max_steps:
@@ -356,11 +382,14 @@ def train(cfg: ExperimentConfig, resume: bool = False) -> None:
             mean_aux = float(running_aux) / running_steps
             dt = time.time() - t0
             tok_s = tokens_per_step * running_steps / dt
-            lr = float(schedule(step))
-            print(f"step {step + 1:>7}/{tc.max_steps} | loss {mean_total:6.4f} | "
-                  f"ce {mean_ce:6.4f} | ppl {math.exp(mean_ce):8.2f} "
-                  f"| aux {mean_aux:.4f} "
-                  f"| lr {lr:.2e} | {tok_s:,.0f} tok/s", flush=True)
+            lr = float(np.asarray(schedule(step)))
+            print(
+                f"step {step + 1:>7}/{tc.max_steps} | loss {mean_total:6.4f} | "
+                f"ce {mean_ce:6.4f} | ppl {math.exp(mean_ce):8.2f} "
+                f"| aux {mean_aux:.4f} "
+                f"| lr {lr:.2e} | {tok_s:,.0f} tok/s",
+                flush=True,
+            )
             running_total = running_ce = running_aux = None
             running_steps, t0 = 0, time.time()
 
@@ -370,17 +399,18 @@ def train(cfg: ExperimentConfig, resume: bool = False) -> None:
             # compute to evaluation and make the later throughput rate too high.
             jax.block_until_ready(total)
             pause_t = time.time()
-            m = evaluate_loss(model, eval_step, make_val_iter(), tc.eval_steps,
-                              shard=shard_batch)
-            print(f"  [eval] step {step + 1} | val_loss {m['val_loss']:.4f} | "
-                  f"val_ppl {m['val_ppl']:.2f}", flush=True)
+            m = evaluate_loss(model, eval_step, make_val_iter(), tc.eval_steps, shard=shard_batch)
+            print(
+                f"  [eval] step {step + 1} | val_loss {m['val_loss']:.4f} | "
+                f"val_ppl {m['val_ppl']:.2f}",
+                flush=True,
+            )
             t0 += time.time() - pause_t  # exclude eval without discarding train batches
 
         if (step + 1) % tc.save_every == 0:
             jax.block_until_ready(total)
             pause_t = time.time()
-            ckpt.save(step, model=model, optimizer=optimizer, rngs=rngs,
-                      train_iterator=train_iter)
+            ckpt.save(step, model=model, optimizer=optimizer, rngs=rngs, train_iterator=train_iter)
             # Block until the async save commits BEFORE training resumes. Orbax pins the
             # full fp32 optimizer state (Muon momentum + Adam moments) on-device until the save
             # finishes; letting the next steps run concurrently stacks their working set
@@ -394,8 +424,9 @@ def train(cfg: ExperimentConfig, resume: bool = False) -> None:
     # step (max_steps a multiple of save_every), where re-saving the same step
     # would raise StepAlreadyExistsError in Orbax.
     if ckpt.latest_step() != tc.max_steps - 1:
-        ckpt.save(tc.max_steps - 1, model=model, optimizer=optimizer, rngs=rngs,
-                  train_iterator=train_iter)
+        ckpt.save(
+            tc.max_steps - 1, model=model, optimizer=optimizer, rngs=rngs, train_iterator=train_iter
+        )
         ckpt.wait_until_finished()
     print(f"Training complete. Final checkpoint at step {tc.max_steps - 1}.")
     ckpt.close()
@@ -405,8 +436,9 @@ def main() -> None:
     """CLI entry point for a fresh or resumed training run."""
     ap = argparse.ArgumentParser(description="Train Kimi-K3-GDN2 on CodeParrot.")
     ap.add_argument("--config", required=True)
-    ap.add_argument("--resume", action="store_true",
-                    help="Resume from the latest checkpoint in train.ckpt_dir.")
+    ap.add_argument(
+        "--resume", action="store_true", help="Resume from the latest checkpoint in train.ckpt_dir."
+    )
     args = ap.parse_args()
     train(ExperimentConfig.load(args.config), resume=args.resume)
 

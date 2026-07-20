@@ -25,8 +25,7 @@ def _x(key=0):
 
 
 def test_grouped_gemm_moe_matches_dense():
-    moe = GroupedGemmMoE(
-        D_MODEL, D_FF, n_routed=8, n_shared=1, top_k=2, rngs=nnx.Rngs(0))
+    moe = GroupedGemmMoE(D_MODEL, D_FF, n_routed=8, n_shared=1, top_k=2, rngs=nnx.Rngs(0))
     x = _x()
     out, aux = moe(x)
     np.testing.assert_allclose(out, moe.dense_forward(x), rtol=1e-4, atol=1e-4)
@@ -35,8 +34,16 @@ def test_grouped_gemm_moe_matches_dense():
 
 def test_latent_moe_matches_dense():
     moe = LatentMoE(
-        D_MODEL, D_LATENT, D_FF, n_routed=8, n_shared=1, top_k=2,
-        n_groups=4, topk_groups=2, rngs=nnx.Rngs(0))
+        D_MODEL,
+        D_LATENT,
+        D_FF,
+        n_routed=8,
+        n_shared=1,
+        top_k=2,
+        n_groups=4,
+        topk_groups=2,
+        rngs=nnx.Rngs(0),
+    )
     x = _x(1)
     out, aux = moe(x)
     np.testing.assert_allclose(out, moe.dense_forward(x), rtol=1e-4, atol=1e-4)
@@ -49,8 +56,7 @@ def test_latent_moe_matches_dense():
 def test_aux_loss_uses_normalized_sigmoid_probs():
     """The balancing loss must build P_e from the NORMALIZED SIGMOID affinities
     the router routes with (DeepSeek-V3 Eq. 18), not a softmax."""
-    moe = GroupedGemmMoE(
-        D_MODEL, D_FF, n_routed=8, n_shared=1, top_k=2, rngs=nnx.Rngs(0))
+    moe = GroupedGemmMoE(D_MODEL, D_FF, n_routed=8, n_shared=1, top_k=2, rngs=nnx.Rngs(0))
     x = _x(3)
     _, aux = moe(x)
 
@@ -59,16 +65,23 @@ def test_aux_loss_uses_normalized_sigmoid_probs():
     probs = (scores / (scores.sum(-1, keepdims=True) + 1e-9)).mean(0)
     load = aux["group_sizes"].astype(jnp.float32) / aux["group_sizes"].sum()
     expected = moe.aux_alpha * moe.E * jnp.sum(load * probs)
-    np.testing.assert_allclose(float(aux["aux_loss"]), float(expected),
-                               rtol=1e-6, atol=1e-8)
+    np.testing.assert_allclose(float(aux["aux_loss"]), float(expected), rtol=1e-6, atol=1e-8)
 
 
 def test_group_limited_routing_respects_groups():
     """Every token's top-k experts must fall inside its topk_groups best groups."""
     n_routed, n_groups, topk_groups, top_k = 8, 4, 2, 2
     moe = LatentMoE(
-        D_MODEL, D_LATENT, D_FF, n_routed=n_routed, n_shared=1, top_k=top_k,
-        n_groups=n_groups, topk_groups=topk_groups, rngs=nnx.Rngs(0))
+        D_MODEL,
+        D_LATENT,
+        D_FF,
+        n_routed=n_routed,
+        n_shared=1,
+        top_k=top_k,
+        n_groups=n_groups,
+        topk_groups=topk_groups,
+        rngs=nnx.Rngs(0),
+    )
     xf = _x(2).reshape(-1, D_MODEL)
     top_idx, _, _ = moe._route(xf)
     groups_hit = jnp.sort(top_idx // (n_routed // n_groups), axis=-1)
@@ -87,8 +100,6 @@ def test_update_router_bias_direction():
 
 def test_latent_moe_never_allocates_full_width_experts():
     """The subclass must not inherit the parent's full-width expert stacks."""
-    moe = LatentMoE(
-        D_MODEL, D_LATENT, D_FF, n_routed=8, n_shared=1, top_k=2,
-        rngs=nnx.Rngs(0))
+    moe = LatentMoE(D_MODEL, D_LATENT, D_FF, n_routed=8, n_shared=1, top_k=2, rngs=nnx.Rngs(0))
     assert moe.w_in.shape == (8, D_LATENT, 2 * D_FF)
     assert moe.w_out.shape == (8, D_FF, D_LATENT)

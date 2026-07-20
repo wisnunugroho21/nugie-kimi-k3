@@ -61,7 +61,8 @@ class PackedTokenSource:
         if self._len == 0:
             raise ValueError(
                 f"{self.bin_path} has {n_tokens} tokens, too few for one window of "
-                f"seq_len={seq_len}. Prepare more data or lower data.seq_len.")
+                f"seq_len={seq_len}. Prepare more data or lower data.seq_len."
+            )
         self._mmap: np.memmap | None = None
 
     def _data(self) -> np.memmap:
@@ -72,12 +73,11 @@ class PackedTokenSource:
     def __len__(self) -> int:
         return self._len
 
-    def __getitem__(self, idx: int) -> dict[str, np.ndarray]:
-        if not 0 <= idx < self._len:
-            raise IndexError(idx)
-        start = idx * self.seq_len
-        window = np.asarray(
-            self._data()[start : start + self.seq_len + 1], dtype=np.int32)
+    def __getitem__(self, index: int) -> dict[str, np.ndarray]:
+        if not 0 <= index < self._len:
+            raise IndexError(index)
+        start = index * self.seq_len
+        window = np.asarray(self._data()[start : start + self.seq_len + 1], dtype=np.int32)
         return {"input_ids": window[:-1], "target_ids": window[1:]}
 
 
@@ -120,7 +120,8 @@ def make_loader(
     ds = ds.batch(batch_size, drop_remainder=True)
 
     read_options = grain.ReadOptions(
-        num_threads=max(1, num_workers), prefetch_buffer_size=4 * max(1, num_workers))
+        num_threads=max(1, num_workers), prefetch_buffer_size=4 * max(1, num_workers)
+    )
     return ds.to_iter_dataset(read_options=read_options).__iter__()
 
 
