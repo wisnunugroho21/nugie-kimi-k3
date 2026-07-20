@@ -20,7 +20,7 @@ depth-attention residual backbone.
 | **Block Attention Residuals** | [arXiv:2603.15031](https://arxiv.org/abs/2603.15031) | `kimi_k3_gdn2.py` | Softmax attention over *depth*: each sub-layer's input is a learned mixture of the embedding, completed block sums, and the current partial sum. `attn_res: false` restores the plain pre-norm residual stream. |
 | **Gated DeltaNet-2** | [arXiv:2605.22791](https://arxiv.org/abs/2605.22791) | `gated_deltanet_2/` | The linear-attention mixer (¾ of layers). Deliberate stand-in for K3's Kimi Delta Attention — same gated-delta-rule family, but with decoupled erase (`b`) and write (`w`) gates. Five interchangeable chunkwise cores with different numerical/performance trade-offs (`gdn_core`: faithful / stacked_rhs / centered / subchunking / pairwise). |
 | **Gated NoPE MLA** | [arXiv:2505.06708](https://arxiv.org/abs/2505.06708) (gate) | `multi_latent_attention/attention.py` | The full-attention mixer (¼ of layers), in absorbed form — one latent serves as both K and V, so the decode cache stores only latents. No positional encoding (the recurrent layers carry position). Head-wise sigmoid output gate (K3's "Gated MLA"). |
-| **LatentMoE** | [arXiv:2601.18089](https://arxiv.org/abs/2601.18089) | `multi_latent_attention/latent_moe.py` | Every layer's channel mixer: routed experts run in a shared low-rank latent (α = d_model/d_latent = 4 in the main configs), with a full-width shared expert, sigmoid routing, group-limited routing, and DeepSeek-V3 aux-loss-free bias balancing plus a small sequence-level balancing loss. |
+| **LatentMoE** | [arXiv:2601.18089](https://arxiv.org/abs/2601.18089) | `multi_latent_attention/moe.py` | Every layer's channel mixer: routed experts run in a shared low-rank latent (α = d_model/d_latent = 4 in the main configs), with a full-width shared expert, sigmoid routing, group-limited routing, and DeepSeek-V3 aux-loss-free bias balancing plus a small sequence-level balancing loss. |
 | **Muon + Adam fallback** | [arXiv:2502.16982](https://arxiv.org/abs/2502.16982) (Moonlight) | `pipeline/optimizer.py` | Hidden weight matrices → Muon with consistent-RMS scaling; embedding, LM head, biases, norms, and decay parameters → Optax's AdamW fallback with weight decay disabled. Weight decay is applied only to Muon-side matrices. |
 
 Not yet recreated (awaiting the K3 technical report): the "Stable" LatentMoE
@@ -36,8 +36,7 @@ gated_deltanet_2/
   layer.py                 The GDN-2 token-mixer layer (projections, convs, gates, GQA folding)
 multi_latent_attention/
   attention.py             Gated NoPE MLA (absorbed form) + streaming cache
-  moe.py                   Full-width grouped-GEMM MoE (routing base class + reference)
-  latent_moe.py            LatentMoE — routed experts in the shared latent
+  moe.py                   LatentMoE — routed experts in the shared latent
 pipeline/
   config.py                YAML → typed ExperimentConfig
   prepare_data.py          Stage 1: tokenize CodeParrot (or synthetic) into packed memmaps

@@ -1,5 +1,4 @@
-"""Verification of the MoE channel mixers (multi_latent_attention/moe.py,
-latent_moe.py).
+"""Verification of the LatentMoE channel mixer (multi_latent_attention/moe.py).
 
 The dispatched path (sort by expert id -> ragged_dot grouped GEMMs ->
 scatter-add combine) is checked against `dense_forward`, which runs every
@@ -13,8 +12,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from multi_latent_attention.latent_moe import LatentMoE
-from multi_latent_attention.moe import GroupedGemmMoE, update_router_bias
+from multi_latent_attention.moe import LatentMoE, update_router_bias
 
 D_MODEL, D_FF, D_LATENT = 32, 64, 8
 B, L = 2, 24
@@ -22,14 +20,6 @@ B, L = 2, 24
 
 def _x(key=0):
     return jax.random.normal(jax.random.PRNGKey(key), (B, L, D_MODEL))
-
-
-def test_grouped_gemm_moe_matches_dense():
-    moe = GroupedGemmMoE(D_MODEL, D_FF, n_routed=8, n_shared=1, top_k=2, rngs=nnx.Rngs(0))
-    x = _x()
-    out, aux = moe(x)
-    np.testing.assert_allclose(out, moe.dense_forward(x), rtol=1e-4, atol=1e-4)
-    assert int(aux["group_sizes"].sum()) == B * L * moe.top_k
 
 
 def test_latent_moe_matches_dense():
@@ -56,7 +46,15 @@ def test_latent_moe_matches_dense():
 def test_aux_loss_uses_normalized_sigmoid_probs():
     """The balancing loss must build P_e from the NORMALIZED SIGMOID affinities
     the router routes with (DeepSeek-V3 Eq. 18), not a softmax."""
-    moe = GroupedGemmMoE(D_MODEL, D_FF, n_routed=8, n_shared=1, top_k=2, rngs=nnx.Rngs(0))
+    moe = LatentMoE(
+        D_MODEL,
+        D_LATENT,
+        D_FF,
+        n_routed=8,
+        n_shared=1,
+        top_k=2,
+        rngs=nnx.Rngs(0),
+    )
     x = _x(3)
     _, aux = moe(x)
 
@@ -99,7 +97,7 @@ def test_update_router_bias_direction():
 
 
 def test_latent_moe_never_allocates_full_width_experts():
-    """The subclass must not inherit the parent's full-width expert stacks."""
+    """LatentMoE allocates only latent-width routed expert stacks."""
     moe = LatentMoE(D_MODEL, D_LATENT, D_FF, n_routed=8, n_shared=1, top_k=2, rngs=nnx.Rngs(0))
     assert moe.w_in.shape == (8, D_LATENT, 2 * D_FF)
     assert moe.w_out.shape == (8, D_FF, D_LATENT)
