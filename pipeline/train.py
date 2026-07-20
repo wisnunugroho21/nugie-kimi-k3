@@ -66,6 +66,7 @@ _CHECK_KW = ("check_vma" if "check_vma" in inspect.signature(_shard_map_impl).pa
 
 
 def shard_map(f, **kwargs):
+    """Call the installed JAX shard_map variant with its VMA check disabled."""
     return _shard_map_impl(f, **kwargs, **{_CHECK_KW: False})
 
 
@@ -81,6 +82,7 @@ from pipeline.optimizer import make_optimizer
 #  Model / optimizer construction (shared with evaluate.py).
 # --------------------------------------------------------------------------- #
 def build_model(cfg: ExperimentConfig, rngs: nnx.Rngs) -> KimiK3:
+    """Build a model from the validated architecture configuration."""
     return KimiK3(cfg.model, rngs=rngs)
 
 
@@ -219,16 +221,20 @@ def evaluate_loss(model: KimiK3, eval_step, val_iter, steps: int,
     """Mean CE / perplexity over `steps` val batches. Sets the model to eval mode so
     any train-only behavior is disabled (harmless here; good hygiene). `shard`, if
     given, places each batch on the data-parallel sharding used by the params."""
+    if steps <= 0:
+        raise ValueError("steps must be positive")
     model.eval()
     tot_ce, tot_tok = 0.0, 0.0
-    for _ in range(steps):
-        batch = _to_jax(next(val_iter))
-        if shard is not None:
-            batch = shard(batch)
-        ce_sum, n = eval_step(model, batch)
-        tot_ce += float(ce_sum)
-        tot_tok += float(n)
-    model.train()
+    try:
+        for _ in range(steps):
+            batch = _to_jax(next(val_iter))
+            if shard is not None:
+                batch = shard(batch)
+            ce_sum, n = eval_step(model, batch)
+            tot_ce += float(ce_sum)
+            tot_tok += float(n)
+    finally:
+        model.train()
     mean_ce = tot_ce / max(tot_tok, 1.0)
     return {"val_loss": mean_ce, "val_ppl": math.exp(mean_ce)}
 
@@ -241,6 +247,8 @@ def _to_jax(batch: dict) -> dict[str, jax.Array]:
 #  Training loop.
 # --------------------------------------------------------------------------- #
 def train(cfg: ExperimentConfig, resume: bool = False) -> None:
+    """Run training to max_steps, optionally restoring the latest full checkpoint."""
+    cfg.validate()
     tc = cfg.train
     print(f"JAX devices: {jax.devices()}")
 
@@ -287,7 +295,7 @@ def train(cfg: ExperimentConfig, resume: bool = False) -> None:
     mesh = Mesh(np.asarray(devices), ("data",))
     data_shard = NamedSharding(mesh, P("data"))  # split batch across devices
     repl_shard = NamedSharding(mesh, P())        # replicate params/opt state
-    # Replicate the model params, the Adam optimizer state, and the rng stream across
+    # Replicate the model params, optimizer state, and RNG stream across
     # all devices. (In this Flax version nnx.Optimizer does NOT nest the model, so the
     # two must be replicated explicitly.) This also fixes the sharding of the abstract
     # targets used on checkpoint restore below.
@@ -303,53 +311,84 @@ def train(cfg: ExperimentConfig, resume: bool = False) -> None:
     # --- checkpoint manager (+ optional resume) ---
     ckpt = CheckpointManager(tc.ckpt_dir, keep=tc.keep_checkpoints)
     start_step = 0
-    if resume and ckpt.latest_step() is not None:
+    latest_step = ckpt.latest_step()
+    if latest_step is not None and not resume:
+        ckpt.close()
+        raise FileExistsError(
+            f"Checkpoint directory already contains step {latest_step}; pass "
+            "--resume or choose a different train.ckpt_dir."
+        )
+    if resume and latest_step is not None:
         restored_step, train_iter = ckpt.restore(
             model=model, optimizer=optimizer, rngs=rngs, train_iterator=train_iter)
         start_step = restored_step + 1
         print(f"Resumed from step {restored_step}")
+        if start_step >= tc.max_steps:
+            print(
+                f"Training is already complete for max_steps={tc.max_steps} "
+                f"(latest checkpoint: {restored_step})."
+            )
+            ckpt.close()
+            return
 
     # --- loop ---
     schedule = build_schedule(tc)
     t0 = time.time()
     tokens_per_step = tc.batch_size * cfg.data.seq_len
-    running_ce = None  # device-side accumulator, host-synced only at log_every
+    # Device-side accumulators; host-synced only at each log boundary. The explicit
+    # count matters after resuming from a checkpoint that is not on a log boundary.
+    running_total = running_ce = running_aux = None
+    running_steps = 0
     for step in range(start_step, tc.max_steps):
         batch = shard_batch(_to_jax(next(train_iter)))
         total, ce, aux_loss = train_step(model, optimizer, batch, tc.router_bias_lr)
-        # Keep ce on device: calling float(ce) every step would block the host
+        # Keep the metrics on device: calling float(...) every step would block the host
         # on that step's result and defeat JAX's async dispatch (the device
         # could no longer run ahead while the host prepares the next batch).
+        running_total = total if running_total is None else running_total + total
         running_ce = ce if running_ce is None else running_ce + ce
+        running_aux = aux_loss if running_aux is None else running_aux + aux_loss
+        running_steps += 1
 
         if (step + 1) % tc.log_every == 0:
-            mean_ce = float(running_ce) / tc.log_every  # the one host sync
+            mean_total = float(running_total) / running_steps
+            mean_ce = float(running_ce) / running_steps
+            mean_aux = float(running_aux) / running_steps
             dt = time.time() - t0
-            tok_s = tokens_per_step * tc.log_every / dt
+            tok_s = tokens_per_step * running_steps / dt
             lr = float(schedule(step))
-            print(f"step {step + 1:>7}/{tc.max_steps} | loss {mean_ce:6.4f} | "
-                  f"ppl {math.exp(mean_ce):8.2f} | aux {float(aux_loss):.4f} "
+            print(f"step {step + 1:>7}/{tc.max_steps} | loss {mean_total:6.4f} | "
+                  f"ce {mean_ce:6.4f} | ppl {math.exp(mean_ce):8.2f} "
+                  f"| aux {mean_aux:.4f} "
                   f"| lr {lr:.2e} | {tok_s:,.0f} tok/s", flush=True)
-            running_ce, t0 = None, time.time()
+            running_total = running_ce = running_aux = None
+            running_steps, t0 = 0, time.time()
 
         if (step + 1) % tc.eval_every == 0:
+            # Finish the current training work before timing the interruption;
+            # otherwise JAX's asynchronous dispatch would charge pending train
+            # compute to evaluation and make the later throughput rate too high.
+            jax.block_until_ready(total)
+            pause_t = time.time()
             m = evaluate_loss(model, eval_step, make_val_iter(), tc.eval_steps,
                               shard=shard_batch)
             print(f"  [eval] step {step + 1} | val_loss {m['val_loss']:.4f} | "
                   f"val_ppl {m['val_ppl']:.2f}", flush=True)
-            t0 = time.time()  # don't count eval time against tok/s
+            t0 += time.time() - pause_t  # exclude eval without discarding train batches
 
         if (step + 1) % tc.save_every == 0:
+            jax.block_until_ready(total)
+            pause_t = time.time()
             ckpt.save(step, model=model, optimizer=optimizer, rngs=rngs,
                       train_iterator=train_iter)
             # Block until the async save commits BEFORE training resumes. Orbax pins the
-            # full fp32 optimizer state (params + Adam m/v) on-device until the save
+            # full fp32 optimizer state (Muon momentum + Adam moments) on-device until the save
             # finishes; letting the next steps run concurrently stacks their working set
             # on top of it and OOMs small GPUs (e.g. a 15 GB T4). Waiting here serializes
             # save vs. train — a few idle seconds every save_every steps, no memory spike.
             ckpt.wait_until_finished()
             print(f"  [ckpt] saved step {step}", flush=True)
-            t0 = time.time()  # don't count save time against tok/s
+            t0 += time.time() - pause_t  # exclude save without discarding train batches
 
     # Final checkpoint — unless the loop's last in-loop save already covered this
     # step (max_steps a multiple of save_every), where re-saving the same step
@@ -363,6 +402,7 @@ def train(cfg: ExperimentConfig, resume: bool = False) -> None:
 
 
 def main() -> None:
+    """CLI entry point for a fresh or resumed training run."""
     ap = argparse.ArgumentParser(description="Train Kimi-K3-GDN2 on CodeParrot.")
     ap.add_argument("--config", required=True)
     ap.add_argument("--resume", action="store_true",

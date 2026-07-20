@@ -1,6 +1,7 @@
 # Kimi K3 recreation — a hybrid linear-attention code LM in JAX
 
-A from-scratch recreation of the **Kimi K3** architecture (Moonshot AI, July 2026)
+A from-scratch recreation of the [**Kimi K3** architecture](https://www.kimi.com/blog/kimi-k3)
+(Moonshot AI, July 2026)
 in JAX / Flax NNX, trained as a code-autocomplete LM on CodeParrot. K3's backbone
 is the hybrid linear-attention transformer of *Kimi Linear*, extended with
 depth-wise attention residuals, gated MLA, and a latent-space MoE; until the K3
@@ -16,11 +17,11 @@ depth-attention residual backbone.
 
 | Feature | Paper | Where | Notes |
 | --- | --- | --- | --- |
-| **Block Attention Residuals** | arXiv:2603.15031 | `kimi_k3_gdn2.py` | Softmax attention over *depth*: each sub-layer's input is a learned mixture of the embedding, completed block sums, and the current partial sum. `attn_res: false` restores the plain pre-norm residual stream. |
-| **Gated DeltaNet-2** | arXiv:2605.22791 | `gated_deltanet_2/` | The linear-attention mixer (¾ of layers). Deliberate stand-in for K3's Kimi Delta Attention — same gated-delta-rule family, but with decoupled erase (`b`) and write (`w`) gates. Five interchangeable chunkwise cores with different numerics/perf trade-offs (`gdn_core:` faithful / stacked_rhs / centered / subchunking / pairwise). |
-| **Gated NoPE MLA** | arXiv:2505.06708 (gate) | `multi_latent_attention/attention.py` | The full-attention mixer (¼ of layers), in absorbed form — one latent serves as both K and V, so the decode cache stores only latents. No positional encoding (the recurrent layers carry position). Head-wise sigmoid output gate (K3's "Gated MLA"). |
-| **LatentMoE** | arXiv:2601.18089 | `multi_latent_attention/latent_moe.py` | Every layer's channel mixer: routed experts run in a shared low-rank latent (α = d_model/d_latent = 4 in the configs), with a full-width shared expert, sigmoid routing, group-limited routing, and DeepSeek-V3 aux-loss-free bias balancing plus a small sequence-level balancing loss. |
-| **Muon + AdamW** | arXiv:2502.16982 (Moonlight) | `pipeline/optimizer.py` | Hidden weight matrices → Muon (with consistent-RMS scaling, so AdamW's LR works unchanged); embedding, LM head, biases, norms, and decay parameters → AdamW. |
+| **Block Attention Residuals** | [arXiv:2603.15031](https://arxiv.org/abs/2603.15031) | `kimi_k3_gdn2.py` | Softmax attention over *depth*: each sub-layer's input is a learned mixture of the embedding, completed block sums, and the current partial sum. `attn_res: false` restores the plain pre-norm residual stream. |
+| **Gated DeltaNet-2** | [arXiv:2605.22791](https://arxiv.org/abs/2605.22791) | `gated_deltanet_2/` | The linear-attention mixer (¾ of layers). Deliberate stand-in for K3's Kimi Delta Attention — same gated-delta-rule family, but with decoupled erase (`b`) and write (`w`) gates. Five interchangeable chunkwise cores with different numerical/performance trade-offs (`gdn_core`: faithful / stacked_rhs / centered / subchunking / pairwise). |
+| **Gated NoPE MLA** | [arXiv:2505.06708](https://arxiv.org/abs/2505.06708) (gate) | `multi_latent_attention/attention.py` | The full-attention mixer (¼ of layers), in absorbed form — one latent serves as both K and V, so the decode cache stores only latents. No positional encoding (the recurrent layers carry position). Head-wise sigmoid output gate (K3's "Gated MLA"). |
+| **LatentMoE** | [arXiv:2601.18089](https://arxiv.org/abs/2601.18089) | `multi_latent_attention/latent_moe.py` | Every layer's channel mixer: routed experts run in a shared low-rank latent (α = d_model/d_latent = 4 in the main configs), with a full-width shared expert, sigmoid routing, group-limited routing, and DeepSeek-V3 aux-loss-free bias balancing plus a small sequence-level balancing loss. |
+| **Muon + Adam fallback** | [arXiv:2502.16982](https://arxiv.org/abs/2502.16982) (Moonlight) | `pipeline/optimizer.py` | Hidden weight matrices → Muon with consistent-RMS scaling; embedding, LM head, biases, norms, and decay parameters → Optax's AdamW fallback with weight decay disabled. Weight decay is applied only to Muon-side matrices. |
 
 Not yet recreated (awaiting the K3 technical report): the "Stable" LatentMoE
 additions, Quantile Balancing, Per-Head Muon, and K3's multimodal / 1M-context
@@ -83,9 +84,10 @@ python -m pipeline.evaluate     --config configs/base.yaml --generate \
 | `base.yaml` | 148M | one modern GPU | The reference single-GPU recipe |
 | `h200.yaml` | 1.1B | H200 141 GB | Sparse-MoE run with headroom to scale further |
 
-Constraints validated at startup: `data.seq_len` must be a multiple of
-`model.gdn_chunk_size` and at most `model.max_seq_len`; `model.vocab_size` must
-match the tokenized data; `train.batch_size` must divide by the device count.
+Configuration ranges and cross-field constraints are validated at startup. In
+particular, `data.seq_len` must be a multiple of `model.gdn_chunk_size` and at
+most `model.max_seq_len`; `model.vocab_size` must match the tokenizer and
+prepared data; and `train.batch_size` must divide evenly across the device count.
 
 **Gradient checkpointing** (`model.remat`, enabled in the GPU configs): each
 decoder layer is recomputed during the backward pass instead of storing its
@@ -96,7 +98,12 @@ forward compute. Gradients are identical to the un-checkpointed forward
 ## Inference API
 
 ```python
-model = KimiK3(cfg, rngs=nnx.Rngs(0))
+import flax.nnx as nnx
+import jax
+from kimi_k3_gdn2 import KimiK3, KimiK3Config
+
+model_cfg = KimiK3Config()
+model = KimiK3(model_cfg, rngs=nnx.Rngs(0))
 logits, aux = model(input_ids)                      # training: full-sequence, chunkwise-parallel
 
 out = model.generate(prompt_ids, max_new_tokens=128,  # streaming: O(1)/token for GDN-2 layers,
@@ -105,7 +112,9 @@ out = model.generate(prompt_ids, max_new_tokens=128,  # streaming: O(1)/token fo
 ```
 
 `temperature=0` (default) decodes greedily; `eos_id` stops once every batch row
-has finished. Lower-level streaming: `model.init_cache(...)` + `model.step(...)`.
+has finished. By default, prompt plus continuation must fit `model_cfg.max_seq_len`;
+pass a larger explicit `max_len` only when you intentionally want a larger MLA
+cache. Lower-level streaming: `model.init_cache(...)` + `model.step(...)`.
 
 ## Tests
 

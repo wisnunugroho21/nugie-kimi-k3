@@ -14,9 +14,10 @@ WHY PACKED MEMMAP
     slices contiguous (seq_len+1) windows — O(1) per example, zero re-tokenization.
 
 SOURCES
-    source="huggingface": streams `codeparrot/codeparrot-train-v2-near-dedup` from the Hub. The
-        corpus has only a train split, so we carve validation out of the head of the
-        stream (first num_val_docs) and take training docs after it.
+    source="huggingface": streams the configured dataset from the Hub. When the
+        configured validation and training split names are equal (as for CodeParrot),
+        validation is carved from the head of the stream; otherwise a native
+        validation split is loaded independently.
     source="synthetic": writes random token ids locally — no network, no tokenizer
         download — so the full prepare->train->eval path can run offline / in CI.
 
@@ -39,7 +40,10 @@ _FLUSH_TOKENS = 1_000_000  # write to disk in ~1M-token chunks to bound memory
 
 
 def _dtype_for(vocab_size: int) -> np.dtype:
-    return np.dtype(np.uint16 if vocab_size <= 2**16 else np.uint32)
+    if not 1 < vocab_size <= 2**32:
+        raise ValueError("vocab_size must be between 2 and 2**32")
+    # An explicit byte order keeps files portable and matches the documented format.
+    return np.dtype("<u2" if vocab_size <= 2**16 else "<u4")
 
 
 def _write_stream(path: Path, token_iter, dtype: np.dtype) -> int:
@@ -74,6 +78,8 @@ def _hf_doc_tokens(docs, tokenizer, text_field: str, dtype: np.dtype):
         text = doc[text_field]
         if not text:
             continue
+        if not isinstance(text, str):
+            raise TypeError(f"Document field {text_field!r} must contain text")
         ids = tokenizer.encode(text)
         ids.append(eos)
         yield np.asarray(ids, dtype=dtype)
@@ -90,7 +96,7 @@ def _synthetic_tokens(
     produced = 0
     while produced < n_tokens:
         n = min(int(rng.integers(50, 250)), n_tokens - produced)
-        ids = rng.integers(1, vocab_size, size=n, dtype=dtype)
+        ids = rng.integers(1, vocab_size, size=n, dtype=dtype.type)
         ids[-1] = eos_id
         produced += n
         yield ids
@@ -98,6 +104,8 @@ def _synthetic_tokens(
 
 # --------------------------------------------------------------------------- #
 def prepare(cfg: ExperimentConfig) -> None:
+    """Materialize configured train/validation token streams and their metadata."""
+    cfg.validate()
     data_dir = Path(cfg.data.data_dir)
     data_dir.mkdir(parents=True, exist_ok=True)
     train_bin, val_bin = data_dir / "train.bin", data_dir / "val.bin"
@@ -130,17 +138,36 @@ def prepare(cfg: ExperimentConfig) -> None:
             cfg.data.tokenizer,
         )
         dtype = _dtype_for(vocab_size)
+        if vocab_size != cfg.model.vocab_size:
+            raise ValueError(
+                f"Tokenizer vocab_size ({vocab_size}) does not match "
+                f"model.vocab_size ({cfg.model.vocab_size}); update the YAML first."
+            )
         print(
             f"[huggingface] {cfg.data.hf_dataset} tok={cfg.data.tokenizer} "
             f"vocab={vocab_size} dtype={dtype}"
         )
 
-        stream = load_dataset(
+        train_source = load_dataset(
             cfg.data.hf_dataset, split=cfg.data.hf_train_split, streaming=True
         )
 
-        # Val = head of the stream; train = the docs after it (disjoint).
-        val_docs = stream.take(cfg.data.num_val_docs) if cfg.data.num_val_docs else []
+        if cfg.data.hf_val_split == cfg.data.hf_train_split:
+            # Validation is the head of the training stream; skip the same documents
+            # in the training view so the two outputs remain disjoint.
+            num_val_docs = cfg.data.num_val_docs
+            if num_val_docs is None:  # defensive; cfg.validate() normally catches this
+                raise ValueError("num_val_docs is required when the split names match")
+            val_docs = train_source.take(num_val_docs)
+            train_stream = train_source.skip(num_val_docs)
+        else:
+            val_docs = load_dataset(
+                cfg.data.hf_dataset, split=cfg.data.hf_val_split, streaming=True
+            )
+            if cfg.data.num_val_docs is not None:
+                val_docs = val_docs.take(cfg.data.num_val_docs)
+            train_stream = train_source
+
         print("Tokenizing validation split...")
         n_val = _write_stream(
             val_bin,
@@ -148,8 +175,7 @@ def prepare(cfg: ExperimentConfig) -> None:
             dtype,
         )
 
-        train_stream = stream.skip(cfg.data.num_val_docs or 0)
-        if cfg.data.num_train_docs:
+        if cfg.data.num_train_docs is not None:
             train_stream = train_stream.take(cfg.data.num_train_docs)
         print("Tokenizing training split...")
         n_train = _write_stream(
@@ -160,14 +186,8 @@ def prepare(cfg: ExperimentConfig) -> None:
     else:
         raise ValueError(f"Unknown data.source: {cfg.data.source!r}")
 
-    if vocab_size != cfg.model.vocab_size:
-        print(
-            f"WARNING: tokenizer vocab {vocab_size} != model.vocab_size "
-            f"{cfg.model.vocab_size}. Set model.vocab_size = {vocab_size} in the YAML."
-        )
-
     meta = {
-        "dtype": np.dtype(dtype).name,
+        "dtype": np.dtype(dtype).str,
         "vocab_size": int(vocab_size),
         "eos_id": int(eos_id),
         "tokenizer": tok_name,
@@ -181,6 +201,7 @@ def prepare(cfg: ExperimentConfig) -> None:
 
 
 def main() -> None:
+    """CLI entry point for packed-data preparation."""
     ap = argparse.ArgumentParser(description="Tokenize CodeParrot into packed memmaps.")
     ap.add_argument("--config", required=True, help="Path to the experiment YAML.")
     args = ap.parse_args()

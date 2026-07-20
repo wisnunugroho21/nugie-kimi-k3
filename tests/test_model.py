@@ -14,6 +14,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+import pytest
 
 from kimi_k3_gdn2 import KimiK3, KimiK3Config, count_params
 from multi_latent_attention.attention import GroupedQueryLatentAttention
@@ -84,6 +85,19 @@ def test_generate_greedy_and_sampling():
     except ValueError:
         pass
 
+    with pytest.raises(ValueError, match="top_p"):
+        model.generate(prompt, max_new_tokens=4, top_p=0.0)
+    with pytest.raises(ValueError, match="max_len"):
+        model.generate(prompt, max_new_tokens=4, max_len=11)
+
+
+def test_streaming_rejects_wrong_cache_count():
+    model = make_model()
+    ids = jnp.ones((1, 1), jnp.int32)
+    caches = model.init_cache(1, max_len=8)
+    with pytest.raises(ValueError, match="layer caches"):
+        model.step(ids, caches[:-1])
+
 
 def test_generate_eos_early_stop():
     """With eos_id set, generation stops once every row has emitted it, and
@@ -123,6 +137,9 @@ def test_mla_step_matches_call():
     out2, _ = attn.step(x[:, 13:], cache)
     np.testing.assert_allclose(
         jnp.concatenate([out1, out2], axis=1), full, rtol=2e-4, atol=2e-4)
+
+    with pytest.raises(ValueError, match="capacity exceeded"):
+        attn.step(x[:, :1], cache._replace(pos=jnp.array(20, jnp.int32)))
 
 
 def test_remat_matches_no_remat():

@@ -1,7 +1,7 @@
 # Core JAX stack (install the CUDA build of jax on GPU: pip install -U "jax[cuda12]")
 jax>=0.6
-flax>=0.10
-optax>=0.2.4            # Muon (pipeline/optimizer.py) needs optax.contrib.muon w/ MuonDimensionNumbers + consistent_rms; tested on 0.2.8
+flax>=0.11              # nnx.Optimizer(model, tx, wrt=...) and update(model, grads)
+optax>=0.2.7            # contrib.muon with MuonDimensionNumbers + consistent_rms; tested on 0.2.8
 orbax-checkpoint>=0.6
 
 # Data pipeline

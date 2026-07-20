@@ -88,6 +88,15 @@ class GroupedQueryLatentAttention(nnx.Module):
         compute_dtype: jnp.dtype = F32,
         gated: bool = False,
     ):
+        dims = {
+            "embed_dim": embed_dim,
+            "num_q_heads": num_q_heads,
+            "num_kv_heads": num_kv_heads,
+            "head_dim": head_dim,
+        }
+        invalid = [name for name, value in dims.items() if value <= 0]
+        if invalid:
+            raise ValueError(f"Attention dimensions must be positive: {', '.join(invalid)}")
         # Matmul dtype for the projections (bf16 on H200); the QK^T / softmax / AV
         # core is upcast to fp32 below regardless, for a stable attention distribution.
         self.compute_dtype = compute_dtype
@@ -253,10 +262,16 @@ class GroupedQueryLatentAttention(nnx.Module):
     def init_cache(self, batch_size: int, max_len: int, dtype=None) -> MLACache:
         """Initialize the streaming KV cache for a given batch size and max length.
         The cache is a zero-filled preallocated buffer of shape [B, max_len, Hkv*Dh]
-        plus a position counter. dtype defaults to fp32 (None => fp32)."""
+        plus a position counter. dtype defaults to the layer's compute dtype so
+        full-sequence and streaming attention use the same projection precision."""
+        if batch_size <= 0 or max_len <= 0:
+            raise ValueError("batch_size and max_len must be positive")
         d_kv = self.num_kv_heads * self.head_dim
         return MLACache(
-            l_kv=jnp.zeros((batch_size, max_len, d_kv), dtype or F32),
+            l_kv=jnp.zeros(
+                (batch_size, max_len, d_kv),
+                self.compute_dtype if dtype is None else dtype,
+            ),
             pos=jnp.array(0, jnp.int32),
         )
 
@@ -265,6 +280,27 @@ class GroupedQueryLatentAttention(nnx.Module):
         x: [B, L, embed_dim]  cache: MLACache with l_kv: [B, max_len, Hkv*Dh], pos: scalar int32"""
         B, L, _ = x.shape
         max_len = cache.l_kv.shape[1]
+        if L == 0:
+            raise ValueError("x must contain at least one position")
+        if L > max_len:
+            raise ValueError(f"Input chunk length ({L}) exceeds cache capacity ({max_len})")
+        if cache.l_kv.shape[0] != B:
+            raise ValueError("x batch size does not match the MLA cache")
+        expected_width = self.num_kv_heads * self.head_dim
+        if cache.l_kv.shape[2] != expected_width:
+            raise ValueError(
+                f"MLA cache width must be {expected_width}, got {cache.l_kv.shape[2]}"
+            )
+        # Outside a transformed/JIT context the position is concrete, so fail
+        # loudly instead of relying on dynamic_update_slice's clamping behavior.
+        # generate() performs the same capacity check before entering its jitted
+        # decode loop.
+        if not isinstance(cache.pos, jax.core.Tracer):
+            pos = int(cache.pos)
+            if pos + L > max_len:
+                raise ValueError(
+                    f"MLA cache capacity exceeded: pos={pos}, chunk={L}, max_len={max_len}"
+                )
         new_pos = cache.pos + L
 
         # Queries for the new positions (already in the compressed K space via W_UK).

@@ -82,6 +82,8 @@ _XAVIER = nnx.initializers.variance_scaling(2**-5, "fan_avg", "uniform")
 #  WHOLE state of a GDN-2 layer; both pieces are fixed-size.
 # --------------------------------------------------------------------------- #
 class GDN2Cache(NamedTuple):
+    """Fixed-size recurrent memory plus left context for the three short convolutions."""
+
     recurrent_state: jax.Array  # [B, Hv, dk, dv]  the gated-delta-rule memory S
     q_conv: jax.Array  # [B, conv_size-1, H*dk]   last inputs to the q short-conv
     k_conv: jax.Array  # [B, conv_size-1, H*dk]   last inputs to the k short-conv
@@ -194,6 +196,8 @@ class ShortConv(nnx.Module):
     """
 
     def __init__(self, channels: int, kernel_size: int = 4, *, rngs: nnx.Rngs):
+        if channels <= 0 or kernel_size <= 0:
+            raise ValueError("channels and kernel_size must be positive")
         self.channels = channels
         self.kernel_size = kernel_size
         # Kernel/bias keep the nnx.Conv defaults (LeCun-normal / zeros):
@@ -272,12 +276,30 @@ class GatedDeltaNet2(nnx.Module):
         # chunkwise/recurrent core (core.py) upcasts to fp32 regardless, and the
         # log-decay branch (f_proj) is kept fp32 below — both for numerical safety
         # (App. D.1 / D.3).
+        dims = {
+            "d_model": d_model,
+            "num_heads": num_heads,
+            "head_k_dim": head_k_dim,
+            "head_v_dim": head_v_dim,
+            "chunk_size": chunk_size,
+            "conv_size": conv_size,
+            "sub_chunk_size": sub_chunk_size,
+        }
+        invalid = [name for name, value in dims.items() if value <= 0]
+        if invalid:
+            raise ValueError(f"GDN-2 dimensions must be positive: {', '.join(invalid)}")
         self.compute_dtype = compute_dtype
         self.d_model = d_model
         self.H = num_heads
-        self.Hv = num_v_heads or num_heads
+        self.Hv = num_heads if num_v_heads is None else num_v_heads
 
-        assert self.Hv % self.H == 0, "num_v_heads must be a multiple of num_heads"
+        if self.Hv <= 0 or self.Hv % self.H:
+            raise ValueError("num_v_heads must be a positive multiple of num_heads")
+        valid_cores = {"faithful", "stacked_rhs", "centered", "subchunking", "pairwise"}
+        if core not in valid_cores:
+            raise ValueError(f"core must be one of {sorted(valid_cores)}, got {core!r}")
+        if core == "subchunking" and chunk_size % sub_chunk_size:
+            raise ValueError("sub_chunk_size must divide chunk_size for subchunking")
 
         self.group = self.Hv // self.H  # G, value-head group size (App. C.1)
         self.dk = head_k_dim
@@ -583,8 +605,12 @@ class GatedDeltaNet2(nnx.Module):
         cache (e.g. fp32 against bf16 activations) would silently promote the
         whole conv path at every decode step. The recurrent state S stays fp32
         regardless (App. D.3)."""
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        if max_len is not None and max_len <= 0:
+            raise ValueError("max_len must be positive or None")
         kc = self.conv_size - 1
-        dtype = dtype or self.compute_dtype
+        dtype = self.compute_dtype if dtype is None else dtype
         return GDN2Cache(
             recurrent_state=jnp.zeros(
                 (batch_size, self.Hv, self.dk, self.dv), jnp.float32
@@ -611,10 +637,9 @@ class GatedDeltaNet2(nnx.Module):
         q, k, v, g, b, w, new_conv = self._project(
             x, conv_states=(cache.q_conv, cache.k_conv, cache.v_conv)
         )
-        # We passed real conv_states, so _project always returns updated ones here
-        # (it only returns None on the full-sequence/training path) — assert narrows
-        # the tuple|None type for the checker and documents the invariant.
-        assert new_conv is not None
+        # We passed real conv_states, so _project always returns updated ones here.
+        if new_conv is None:  # defensive guard for future _project refactors
+            raise RuntimeError("streaming projection did not return convolution state")
         qcs, kcs, vcs = new_conv
 
         L = x.shape[1]

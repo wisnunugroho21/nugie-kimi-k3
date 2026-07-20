@@ -20,6 +20,8 @@ from typing import Protocol
 
 
 class Tokenizer(Protocol):
+    """Minimal tokenizer contract consumed by data preparation and generation."""
+
     vocab_size: int
     eos_id: int
 
@@ -29,7 +31,8 @@ class Tokenizer(Protocol):
 
 class ByteTokenizer:
     """UTF-8 byte tokenizer. eos_id reuses byte 0 (NUL) as a document separator —
-    NUL effectively never occurs in source code, so it is a safe boundary marker."""
+    NUL effectively never occurs in source code, so it is a practical boundary
+    marker. Decoding omits it, matching skip-special-token behavior."""
 
     vocab_size = 256
     eos_id = 0
@@ -38,7 +41,9 @@ class ByteTokenizer:
         return list(text.encode("utf-8"))
 
     def decode(self, ids: list[int]) -> str:
-        return bytes(b for b in ids if 0 <= b < 256).decode("utf-8", errors="replace")
+        return bytes(
+            b for b in ids if 0 <= b < 256 and b != self.eos_id
+        ).decode("utf-8", errors="replace")
 
 
 class HFTokenizer:
@@ -48,8 +53,9 @@ class HFTokenizer:
         from transformers import AutoTokenizer
 
         self._tok = AutoTokenizer.from_pretrained(name)
-        # CodeParrot's tokenizer has no dedicated pad/eos; fall back to its bos/eos
-        # if present, else the last vocab id.
+        # Some code tokenizers use BOS as their only document-boundary token. Never
+        # co-opt an ordinary vocabulary item: that would corrupt training targets
+        # and cause generation to stop on a normal token.
         eos = self._tok.eos_token_id
         if eos is None:
             eos = self._tok.bos_token_id
@@ -57,7 +63,11 @@ class HFTokenizer:
         # to len(tok)-1 can appear in encoded text, so the model's embedding (and
         # meta.json's vocab check) must be sized by len(tok).
         self.vocab_size = len(self._tok)
-        self.eos_id = int(eos) if eos is not None else self.vocab_size - 1
+        if eos is None:
+            raise ValueError(
+                f"Tokenizer {name!r} defines neither eos_token_id nor bos_token_id"
+            )
+        self.eos_id = int(eos)
 
     def encode(self, text: str) -> list[int]:
         return self._tok.encode(text, add_special_tokens=False)
@@ -67,6 +77,7 @@ class HFTokenizer:
 
 
 def build_tokenizer(kind: str, name: str = "codeparrot/codeparrot") -> Tokenizer:
+    """Construct the configured byte or Hugging Face tokenizer backend."""
     if kind in ("byte", "synthetic"):
         # Synthetic data has no real tokenizer; decode its ids as raw bytes so the
         # generation path still runs (output is gibberish, as expected offline).

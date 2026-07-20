@@ -269,9 +269,9 @@ def _chunk_inputs(q, k, v, g, b, w, S0, chunk_size):
     Returns ((q, k, v, g, b, w) chunked, S0 in D_TYPE)."""
     L = k.shape[0]
     C = chunk_size
-    if C <= 0 or L % C:
+    if C <= 0 or L <= 0 or L % C:
         raise ValueError(
-            f"chunk_size={C} must be a positive divisor of the sequence "
+            f"chunk_size={C} must be a positive divisor of the non-empty sequence "
             f"length L={L}")
     N = L // C
 

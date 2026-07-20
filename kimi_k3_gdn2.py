@@ -114,6 +114,8 @@ _XAVIER = nnx.initializers.variance_scaling(2**-5, "fan_avg", "uniform")
 # --------------------------------------------------------------------------- #
 @dataclasses.dataclass
 class KimiK3Config:
+    """Architecture, numerical precision, and streaming-context configuration."""
+
     vocab_size: int = 256  # Kimi Linear: 160k; tiny here (byte-level demo)
     d_model: int = 256  # model width  (Kimi Linear 1.3B: 2048)
     n_layers: int = 8  # depth        (Kimi Linear 1.3B: 27)
@@ -144,6 +146,7 @@ class KimiK3Config:
     gdn_conv_size: int = 4  # short-conv kernel width
     gdn_expanded_erase: bool = True  # erase gate in [0,2] (neg-eigenvalue variant)
     gdn_core: str = "pairwise"  # which GDN-2 chunkwise core computes each head (paper: "faithful")
+    gdn_sub_chunk_size: int = 16  # secondary block size for core="subchunking"
 
     # --- MLA full-attention layers (NoPE) — see multi_latent_attention/attention.py ---
     mla_num_q_heads: int = 8  # query heads
@@ -201,6 +204,67 @@ class KimiK3Config:
     def cdtype(self) -> jnp.dtype:
         return jnp.dtype(self.compute_dtype)
 
+    def __post_init__(self) -> None:
+        """Validate architectural invariants before any arrays are allocated."""
+        positive = {
+            "vocab_size": self.vocab_size,
+            "d_model": self.d_model,
+            "n_layers": self.n_layers,
+            "full_attn_period": self.full_attn_period,
+            "attn_res_layers_per_block": self.attn_res_layers_per_block,
+            "gdn_num_heads": self.gdn_num_heads,
+            "gdn_head_k_dim": self.gdn_head_k_dim,
+            "gdn_head_v_dim": self.gdn_head_v_dim,
+            "gdn_chunk_size": self.gdn_chunk_size,
+            "gdn_conv_size": self.gdn_conv_size,
+            "gdn_sub_chunk_size": self.gdn_sub_chunk_size,
+            "mla_num_q_heads": self.mla_num_q_heads,
+            "mla_num_kv_heads": self.mla_num_kv_heads,
+            "mla_head_dim": self.mla_head_dim,
+            "max_seq_len": self.max_seq_len,
+            "moe_d_latent": self.moe_d_latent,
+            "moe_d_ff": self.moe_d_ff,
+            "moe_n_routed": self.moe_n_routed,
+            "moe_n_shared": self.moe_n_shared,
+            "moe_top_k": self.moe_top_k,
+            "moe_n_groups": self.moe_n_groups,
+            "moe_topk_groups": self.moe_topk_groups,
+        }
+        invalid = [name for name, value in positive.items() if value <= 0]
+        if invalid:
+            raise ValueError(f"Config values must be positive: {', '.join(invalid)}")
+        if self.vocab_size < 2:
+            raise ValueError("vocab_size must be at least 2")
+        if self.gdn_num_v_heads is not None:
+            if self.gdn_num_v_heads <= 0:
+                raise ValueError("gdn_num_v_heads must be positive or None")
+            if self.gdn_num_v_heads % self.gdn_num_heads:
+                raise ValueError("gdn_num_v_heads must be a multiple of gdn_num_heads")
+        valid_cores = {"faithful", "stacked_rhs", "centered", "subchunking", "pairwise"}
+        if self.gdn_core not in valid_cores:
+            raise ValueError(f"gdn_core must be one of {sorted(valid_cores)}, got {self.gdn_core!r}")
+        if self.gdn_core == "subchunking" and self.gdn_chunk_size % self.gdn_sub_chunk_size:
+            raise ValueError("gdn_sub_chunk_size must divide gdn_chunk_size for subchunking")
+        if self.mla_num_q_heads % self.mla_num_kv_heads:
+            raise ValueError("mla_num_q_heads must be divisible by mla_num_kv_heads")
+        if self.moe_d_latent > self.d_model:
+            raise ValueError("moe_d_latent must not exceed d_model")
+        if self.moe_n_routed % self.moe_n_groups:
+            raise ValueError("moe_n_routed must be divisible by moe_n_groups")
+        if not 1 <= self.moe_topk_groups <= self.moe_n_groups:
+            raise ValueError("moe_topk_groups must be between 1 and moe_n_groups")
+        experts_per_group = self.moe_n_routed // self.moe_n_groups
+        if self.moe_top_k > self.moe_topk_groups * experts_per_group:
+            raise ValueError("moe_top_k does not fit in the selected expert groups")
+        if self.rms_eps <= 0:
+            raise ValueError("rms_eps must be positive")
+        try:
+            dtype = self.cdtype
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Unknown compute_dtype: {self.compute_dtype!r}") from exc
+        if not jnp.issubdtype(dtype, jnp.floating):
+            raise ValueError(f"compute_dtype must be floating-point, got {self.compute_dtype!r}")
+
 
 # --------------------------------------------------------------------------- #
 #  Attention Residuals operation (arXiv:2603.15031, Eq. 2-4 / Fig. 2).
@@ -231,7 +295,7 @@ class AttnResOp(nnx.Module):
         partial: the intra-block partial sum b_n^i, or None at a block start
         (Eq. 6: the first layer of a block sees only the completed blocks).
         Depth-wise only — every position attends over its own stack of sources,
-        so this is position-independent and needs no sequence cache."""
+        so this does not mix positions and needs no sequence cache."""
         sources = blocks + ([partial] if partial is not None else [])
         V = jnp.stack(sources)  # [N, B, L, d]
         K = self.norm(V.astype(jnp.float32))  # RMSNorm'ed keys, fp32
@@ -250,6 +314,8 @@ class AttnResOp(nnx.Module):
 #  is in the *attention*, not the FFN.
 # --------------------------------------------------------------------------- #
 class DecoderLayer(nnx.Module):
+    """One token-mixer/LatentMoE pair with optional block AttnRes routing."""
+
     def __init__(self, cfg: KimiK3Config, layer_idx: int, *, rngs: nnx.Rngs):
         # 3:1 schedule: this layer is full-attention iff it is the last of its period.
         self.is_full_attn = (layer_idx + 1) % cfg.full_attn_period == 0
@@ -295,6 +361,7 @@ class DecoderLayer(nnx.Module):
                 expanded_erase=cfg.gdn_expanded_erase,
                 compute_dtype=cfg.cdtype,
                 core=cfg.gdn_core,
+                sub_chunk_size=cfg.gdn_sub_chunk_size,
                 rngs=rngs,
             )
 
@@ -369,8 +436,8 @@ class DecoderLayer(nnx.Module):
 
     def init_cache(self, batch_size: int, max_len: int, dtype=None):
         """Per-layer streaming cache: a GDN2Cache (linear layer) or MLACache (MLA).
-        dtype=None lets each mixer pick its own default (GDN-2: its compute_dtype
-        for the conv caches; MLA: fp32 latents). AttnRes needs NO cache — it
+        dtype=None lets each mixer use its compute dtype for cached projections
+        and latents. AttnRes needs NO cache — it
         mixes depth, not positions."""
         return self.token_mixer.init_cache(batch_size, max_len, dtype)
 
@@ -458,6 +525,8 @@ class KimiK3(nnx.Module):
         The training loop uses aux_loss (added to the CE loss) and group_sizes (to nudge
         each MoE layer's router bias); eval/inference paths simply ignore it.
         """
+        if input_ids.ndim != 2 or input_ids.shape[0] == 0 or input_ids.shape[1] == 0:
+            raise ValueError("input_ids must have shape [B, L] with B > 0 and L > 0")
         aux_loss: ArrayLike = 0.0
         group_sizes: list[
             ArrayLike
@@ -512,13 +581,26 @@ class KimiK3(nnx.Module):
         the MLA latent buffers; GDN-2 layers ignore it (their state is fixed-size).
         `dtype` overrides every cache's buffer dtype; None (default) lets each
         mixer choose — GDN-2 conv caches in the layer's compute_dtype (avoiding a
-        silent fp32 promotion of the conv path under bf16), MLA latents in fp32."""
-        max_len = max_len or self.cfg.max_seq_len
+        silent fp32 promotion of the conv path under bf16), and MLA latents in
+        the attention layer's compute_dtype."""
+        max_len = self.cfg.max_seq_len if max_len is None else max_len
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        if max_len <= 0:
+            raise ValueError("max_len must be positive")
         return [layer.init_cache(batch_size, max_len, dtype) for layer in self.layers]
 
     def step(self, input_ids: jax.Array, caches: list) -> tuple[jax.Array, list]:
         """One streaming step. input_ids: int[B, L] (L = prompt length on prefill, or
         1 per decoded token). Returns (logits[B, L, vocab], new_caches)."""
+        if input_ids.ndim != 2 or input_ids.shape[0] == 0 or input_ids.shape[1] == 0:
+            raise ValueError(
+                "input_ids must have shape [batch, length] with both axes non-empty"
+            )
+        if len(caches) != len(self.layers):
+            raise ValueError(
+                f"Expected {len(self.layers)} layer caches, received {len(caches)}"
+            )
         new_caches = []
 
         emb = self.embed(input_ids)
@@ -567,16 +649,32 @@ class KimiK3(nnx.Module):
         cache. The decode loop runs through `_decode_step`, a module-level nnx.jit
         function: it compiles once per (batch size, cache length) and every further
         token — across generate() calls too — reuses the trace."""
+        if prompt_ids.ndim != 2:
+            raise ValueError("prompt_ids must have shape [batch, length]")
         B, P = prompt_ids.shape
+        if B == 0 or P == 0:
+            raise ValueError("prompt_ids must have non-empty batch and length axes")
         if max_new_tokens <= 0:
             return jnp.zeros((B, 0), prompt_ids.dtype)
+        if temperature < 0.0:
+            raise ValueError("temperature must be non-negative")
         if temperature > 0.0 and key is None:
             raise ValueError("temperature > 0 requires a PRNG `key` to sample with")
-        # Default the cache length to the config's declared context cap when the
-        # request fits inside it: a FIXED cache shape lets _decode_step reuse its
-        # compiled trace across generate() calls with different prompt lengths
-        # (e.g. a chat loop) instead of recompiling for every P + max_new_tokens.
-        max_len = max_len or max(self.cfg.max_seq_len, P + max_new_tokens)
+        if not 0.0 < top_p <= 1.0:
+            raise ValueError("top_p must be in (0, 1]")
+        if eos_id is not None and not 0 <= eos_id < self.cfg.vocab_size:
+            raise ValueError(f"eos_id must be in [0, {self.cfg.vocab_size})")
+        # Default to the declared context cap. A fixed cache shape lets
+        # _decode_step reuse its compiled trace across calls with different prompt
+        # lengths; callers may pass a larger explicit max_len when appropriate.
+        required_len = P + max_new_tokens
+        max_len = self.cfg.max_seq_len if max_len is None else max_len
+        if max_len < required_len:
+            raise ValueError(
+                f"max_len ({max_len}) is smaller than prompt + continuation "
+                f"({P} + {max_new_tokens} = {required_len}); an undersized MLA "
+                "cache would overwrite its final slots."
+            )
 
         caches = self.init_cache(B, max_len)
         logits, caches = self.step(prompt_ids, caches)  # prefill the prompt

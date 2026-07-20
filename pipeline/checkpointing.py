@@ -36,6 +36,8 @@ import orbax.checkpoint as ocp
 
 
 class CheckpointManager:
+    """Own an Orbax manager and translate live NNX/Grain objects to checkpoints."""
+
     def __init__(self, ckpt_dir: str, keep: int = 3):
         # Orbax requires an absolute path for its atomic-rename commits.
         self.directory = os.path.abspath(ckpt_dir)
@@ -89,6 +91,7 @@ class CheckpointManager:
         return restored["step"], restored.get("train_iterator")
 
     def latest_step(self) -> int | None:
+        """Return the newest checkpoint step, or None when the directory is empty."""
         return self.mgr.latest_step()
 
     def wait_until_finished(self) -> None:
@@ -96,4 +99,5 @@ class CheckpointManager:
         self.mgr.wait_until_finished()
 
     def close(self) -> None:
+        """Release the underlying Orbax manager and its asynchronous resources."""
         self.mgr.close()

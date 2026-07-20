@@ -11,7 +11,7 @@ RANDOM-ACCESS SOURCE
         target_ids = window[1:]    (length seq_len, shifted by one)
     Non-overlapping stride = seq_len, so every token is a target exactly once per
     epoch. Because it is true random access (__len__ + __getitem__), Grain can
-    shuffle globally and prefetch with worker threads.
+    shuffle globally and prefetch with reader threads.
 
 GRAIN PIPELINE
     MapDataset.source(src).shuffle(seed).repeat().batch(B).to_iter_dataset(...)
@@ -30,6 +30,7 @@ import numpy as np
 
 
 def load_meta(data_dir: str | Path) -> dict:
+    """Load the metadata written beside the packed train/validation binaries."""
     return json.loads((Path(data_dir) / "meta.json").read_text())
 
 
@@ -37,14 +38,23 @@ class PackedTokenSource:
     """Grain RandomAccessDataSource over one packed .bin memmap.
 
     Implements the __len__/__getitem__ protocol Grain expects. The memmap is opened
-    lazily per worker process (see __getitem__) so it survives Grain's multiprocessing
-    pickling — an open np.memmap does not pickle cleanly across processes."""
+    lazily on first access, avoiding an unnecessary file mapping in the source's
+    constructor and keeping the source straightforward to serialize."""
 
     def __init__(self, bin_path: str | Path, seq_len: int, dtype: str):
+        if seq_len <= 0:
+            raise ValueError("seq_len must be positive")
         self.bin_path = str(bin_path)
         self.seq_len = seq_len
         self.dtype = np.dtype(dtype)
-        n_tokens = Path(self.bin_path).stat().st_size // self.dtype.itemsize
+        if self.dtype.kind != "u":
+            raise ValueError(f"Packed token dtype must be unsigned integer, got {self.dtype}")
+        n_bytes = Path(self.bin_path).stat().st_size
+        if n_bytes % self.dtype.itemsize:
+            raise ValueError(
+                f"{self.bin_path} size ({n_bytes} bytes) is not aligned to dtype {self.dtype}"
+            )
+        n_tokens = n_bytes // self.dtype.itemsize
         # Number of non-overlapping (seq_len+1)-token windows we can slice. Need one
         # extra token for the shifted target, hence (n_tokens - 1).
         self._len = max(0, (n_tokens - 1) // seq_len)
@@ -63,6 +73,8 @@ class PackedTokenSource:
         return self._len
 
     def __getitem__(self, idx: int) -> dict[str, np.ndarray]:
+        if not 0 <= idx < self._len:
+            raise IndexError(idx)
         start = idx * self.seq_len
         window = np.asarray(
             self._data()[start : start + self.seq_len + 1], dtype=np.int32)
@@ -83,10 +95,22 @@ def make_loader(
     """Build a Grain iterator yielding {input_ids, target_ids} int32 batches.
 
     split: "train" or "val". shuffle/repeat are typically True for train, False for
-    val. num_workers>0 turns on Grain's multiprocess prefetch."""
+    val. num_workers controls Grain's reader-thread count; zero uses one thread."""
+    if split not in {"train", "val"}:
+        raise ValueError("split must be 'train' or 'val'")
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    if num_workers < 0:
+        raise ValueError("num_workers must be non-negative")
     meta = load_meta(data_dir)
     bin_path = Path(data_dir) / f"{split}.bin"
     source = PackedTokenSource(bin_path, seq_len, meta["dtype"])
+    # Repeating happens before batching, so a tiny repeating source can still
+    # produce full batches. A finite source cannot: drop_remainder would yield none.
+    if not repeat and len(source) < batch_size:
+        raise ValueError(
+            f"{split} split has {len(source)} windows, fewer than batch_size={batch_size}"
+        )
 
     ds = grain.MapDataset.source(source)
     if shuffle:

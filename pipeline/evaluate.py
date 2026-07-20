@@ -39,14 +39,20 @@ def load_trained(cfg: ExperimentConfig, step: int | None = None):
     composite checkpoint; the optimizer/rngs/train_iterator items are left untouched."""
     model = build_model(cfg, nnx.Rngs(cfg.train.seed))
     ckpt = CheckpointManager(cfg.train.ckpt_dir, keep=cfg.train.keep_checkpoints)
-    restored_step, _ = ckpt.restore(step, model=model)
-    ckpt.close()
+    try:
+        restored_step, _ = ckpt.restore(step, model=model)
+    finally:
+        ckpt.close()
     model.eval()
     return model, restored_step
 
 
 # --------------------------------------------------------------------------- #
 def run_eval(cfg: ExperimentConfig, step: int | None, max_batches: int | None) -> None:
+    """Restore a checkpoint and report token-weighted validation metrics."""
+    cfg.validate()
+    if max_batches is not None and max_batches <= 0:
+        raise ValueError("max_batches must be positive or None")
     model, restored = load_trained(cfg, step)
     print(f"Restored step {restored}. Evaluating validation split...")
 
@@ -96,11 +102,28 @@ def run_eval(cfg: ExperimentConfig, step: int | None, max_batches: int | None) -
 def run_generate(cfg: ExperimentConfig, step: int | None, prompt: str,
                  max_new_tokens: int, temperature: float = 0.0,
                  top_p: float = 1.0, seed: int = 0) -> None:
+    """Restore a checkpoint and print one greedy or nucleus-sampled continuation."""
+    cfg.validate()
+    if max_new_tokens < 0:
+        raise ValueError("max_new_tokens must be non-negative")
+    if temperature < 0:
+        raise ValueError("temperature must be non-negative")
+    if not 0 < top_p <= 1:
+        raise ValueError("top_p must be in (0, 1]")
     model, restored = load_trained(cfg, step)
     meta = data_mod.load_meta(cfg.data.data_dir)
     tokenizer = build_tokenizer(
         meta.get("tokenizer", cfg.data.tokenizer), meta.get("tokenizer_name",
                                                             cfg.data.tokenizer_name))
+    if (
+        tokenizer.vocab_size != cfg.model.vocab_size
+        or meta["vocab_size"] != cfg.model.vocab_size
+    ):
+        raise ValueError(
+            "Tokenizer, prepared-data, and model vocabulary sizes must match: "
+            f"tokenizer={tokenizer.vocab_size}, data={meta['vocab_size']}, "
+            f"model={cfg.model.vocab_size}"
+        )
     print(f"Restored step {restored}. Generating...\n")
 
     ids = tokenizer.encode(prompt) or [tokenizer.eos_id]
@@ -137,6 +160,7 @@ def run_generate(cfg: ExperimentConfig, step: int | None, prompt: str,
 
 # --------------------------------------------------------------------------- #
 def main() -> None:
+    """CLI entry point for checkpoint evaluation and generation."""
     ap = argparse.ArgumentParser(description="Evaluate / sample from a checkpoint.")
     ap.add_argument("--config", required=True)
     ap.add_argument("--step", type=int, default=None,

@@ -92,11 +92,27 @@ class LatentMoE(GroupedGemmMoE):
         # NOTE: deliberately NOT calling super().__init__ — it would allocate
         # the full-width expert stacks. Instead set every attribute _route and
         # _shared consume, identically to GroupedGemmMoE.
-        assert n_routed % n_groups == 0, "n_routed must be divisible by n_groups"
-        assert 1 <= topk_groups <= n_groups, "need 1 <= topk_groups <= n_groups"
-        assert top_k <= topk_groups * (n_routed // n_groups), (
-            "top_k experts must fit inside the topk_groups selected groups"
-        )
+        dims = {
+            "d_model": d_model,
+            "d_latent": d_latent,
+            "d_ff": d_ff,
+            "n_routed": n_routed,
+            "n_shared": n_shared,
+            "top_k": top_k,
+            "n_groups": n_groups,
+            "topk_groups": topk_groups,
+        }
+        invalid = [name for name, value in dims.items() if value <= 0]
+        if invalid:
+            raise ValueError(f"MoE dimensions must be positive: {', '.join(invalid)}")
+        if d_latent > d_model:
+            raise ValueError("d_latent must not exceed d_model")
+        if n_routed % n_groups:
+            raise ValueError("n_routed must be divisible by n_groups")
+        if not 1 <= topk_groups <= n_groups:
+            raise ValueError("need 1 <= topk_groups <= n_groups")
+        if top_k > topk_groups * (n_routed // n_groups):
+            raise ValueError("top_k experts must fit inside the selected expert groups")
         self.d_model = d_model
         self.d_latent = d_latent
         self.d_ff = d_ff

@@ -81,11 +81,24 @@ class GroupedGemmMoE(nnx.Module):
         compute_dtype: jnp.dtype = jnp.float32,
         rngs: nnx.Rngs,
     ):
-        assert n_routed % n_groups == 0, "n_routed must be divisible by n_groups"
-        assert 1 <= topk_groups <= n_groups, "need 1 <= topk_groups <= n_groups"
-        assert top_k <= topk_groups * (n_routed // n_groups), (
-            "top_k experts must fit inside the topk_groups selected groups"
-        )
+        dims = {
+            "d_model": d_model,
+            "d_ff": d_ff,
+            "n_routed": n_routed,
+            "n_shared": n_shared,
+            "top_k": top_k,
+            "n_groups": n_groups,
+            "topk_groups": topk_groups,
+        }
+        invalid = [name for name, value in dims.items() if value <= 0]
+        if invalid:
+            raise ValueError(f"MoE dimensions must be positive: {', '.join(invalid)}")
+        if n_routed % n_groups:
+            raise ValueError("n_routed must be divisible by n_groups")
+        if not 1 <= topk_groups <= n_groups:
+            raise ValueError("need 1 <= topk_groups <= n_groups")
+        if top_k > topk_groups * (n_routed // n_groups):
+            raise ValueError("top_k experts must fit inside the selected expert groups")
         self.d_model = d_model
         self.d_ff = d_ff
         self.E = n_routed
@@ -286,7 +299,8 @@ def update_router_bias(
     Nudges the selection bias up for under-loaded experts and down for over-loaded
     ones by a fixed step, driving per-expert load toward uniform without an aux loss.
     """
-    load = group_sizes.astype(F32) / jnp.sum(group_sizes).astype(F32)
+    total = jnp.sum(group_sizes).astype(F32)
+    load = group_sizes.astype(F32) / jnp.maximum(total, 1.0)
     target = 1.0 / bias.shape[0]
     return bias + lr * jnp.sign(target - load)
 
