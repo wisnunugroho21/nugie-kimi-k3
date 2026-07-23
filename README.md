@@ -7,6 +7,8 @@ depth-wise attention residuals, gated MLA, and a latent-space MoE; until the K3
 technical report lands, each feature here is implemented from its best public
 source (annotated throughout the code).
 
+> ⚠️ **Work in Progress**: This project is under active development. Moonshot AI has not yet released a paper or technical report on the LLM model. Expect significant changes, incomplete features, and frequent updates.
+
 ## Architecture
 
 Decoder-only LM: `Embed → [DecoderLayer] × n_layers → RMSNorm → LM head`, where
