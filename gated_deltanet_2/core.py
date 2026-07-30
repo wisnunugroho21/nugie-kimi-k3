@@ -541,7 +541,7 @@ def _chunkwise_single_stacked_RHS_solve(
     Y, U = _wy_solve(T, Ebar, Z)
 
     Aqk = jnp.tril(Qg @ Kbar.swapaxes(-1, -2))   # Eq. 25/43       [N, C, C]
-    Ktail = k * (gamma_C[:, None, :] / gamma)    # Eq. 23/41 (NaN when γ underflows)
+    Ktail = k * jnp.exp(G_C[:, None, :] - G)     # Eq. 23/41
 
     return _cross_chunk_scan(S0, Y, U, Aqk, Qg, Ktail, gamma_C)
 
