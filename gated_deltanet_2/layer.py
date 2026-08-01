@@ -4,14 +4,37 @@ Gated DeltaNet-2 token-mixer layer in Flax NNX, ANNOTATED against the paper
 parameterization), with supporting equations 11, 12, 85, 86 and the numerical
 notes in Appendix D.
 
-Block design (Fig. 1 right; Sec. 3.5 "Gated DeltaNet-2 token mixer"):
+Block design (Fig. 1 right; Sec. 3.5 "Gated DeltaNet-2 token mixer"), with the
+two Kimi K3 substitutions marked [K3] — see below:
   q,k = L2norm(SiLU(ShortConv(Linear(x))))      # key-side paths + L2 norm (Sec. 3.5, App. D.2)
   v   =        SiLU(ShortConv(Linear(x)))        # value path (Sec. 3.5; Fig. 1 caption)
-  g   = -exp(a) ⊙ softplus(Linear_f(x) + delta)  # log-decay, fp32 (Eq. 12 / 86, App. D.1)
+  z   = Linear_f(x) + delta                      # decay logit, fp32 (Eq. 12/86; K3 Eq. 2)
+  g   = g_min * sigmoid(exp(A) * z)              # [K3 Eq. 5] lower-bounded log-decay
+                                                 #   (GDN-2 / Kimi Linear: g = -exp(A)*softplus(z))
   b   = sigmoid(Linear_b(x))                     # erase gate (Eq. 11 / 85); x2 if neg-eigenvalue
   w   = sigmoid(Linear_w(x))                     # write gate (Eq. 11 / 85)
   O   = chunkwise_gated_delta_rule_2(q,k,v,g,b,w, state)   # Gated Delta Rule-2 (Eq. 10)
-  out = Linear_o( RMSNorm(O) * SiLU(Linear_g(x)) )  # gated RMSNorm + out proj (Sec. 3.5, App. D.5)
+  out = Linear_o( RMSNorm(O) * sigmoid(W_g x) )  # [K3 Eq. 6] FULL-RANK output gate
+                                                 #   (Kimi Linear: low-rank W↑g W↓g)
+
+THE TWO KIMI K3 CHANGES
+-----------------------
+K3's token mixer is Kimi Delta Attention (KDA), not GDN-2; this project keeps
+GDN-2's decoupled erase/write gates (b, w) instead of KDA's single scalar β, but
+adopts the two K3 changes that are orthogonal to that choice and are what makes
+K3's linear layer differ from Kimi Linear's:
+
+  * decay_mode="bounded_sigmoid" (K3 Eq. 5, §2.1.1 "Lower-bounded decay"):
+    g = g_min·Sigmoid(exp(A)z) instead of the unbounded -exp(A)·softplus(z).
+    Bounding the decay bounds the reciprocal-decay rescaling in the chunkwise
+    form, which is what removes the numerical-range problem core.py is built
+    around. See the long comment in `_project`.
+  * output_gate_rank=None (K3 Eq. 6, §2.1.1 "Full-rank gate"): the output gate
+    is a plain full-rank projection of x, not Kimi Linear's low-rank factorization.
+
+Both are constructor arguments defaulting to the K3 behaviour; pass
+decay_mode="softplus", output_gate_rank=head_v_dim to recover the Kimi Linear /
+GDN-2 paper block exactly.
 
 Grouped value heads (Sec. 3.5 last sentence / App. C.1): with num_v_heads = G*num_heads,
 the key-side tensors q, k, the log-decay g, and b are shared across the G value heads
@@ -123,21 +146,26 @@ class LowRankLinear(nnx.Module):
 
 
 class GatedRMSNorm(nnx.Module):
-    """Head-wise RMSNorm of the recurrent output, gated by a LOW-RANK SIGMOID gate.
+    """Head-wise RMSNorm of the recurrent output, gated by a SIGMOID gate.
 
-    Implements Kimi Linear Eq. 10's output stage:
+    Implements the output stage of Kimi K3 Eq. 6 (there written for KDA; the same
+    stage is used here for the GDN-2 token mixer):
 
-        Sigmoid(W↑g W↓g x) ⊙ RMSNorm(O)
+        y_t = W_o [ Sigmoid(W_g x_t) ⊙ RMSNorm(õ_t) ]
 
-    Two corrections vs the GDN-2 paper block used in your gdn2_layer:
+    Two corrections vs the plain GDN-2 paper block:
       (1) sigmoid, not SiLU/swish  — Kimi Linear's ablation found the swish output
-          gate (GDN's choice) performs substantially worse than sigmoid, and they
-          adopt sigmoid across all experiments including their GDN hybrid baseline.
-      (2) low-rank gate (W↑ W↓), rank = head dim — Kimi Linear factorizes the gate
-          "to ensure a fair parameter comparison" against the full-attention baseline.
+          gate (GDN's choice) performs substantially worse than sigmoid, and the
+          Kimi line adopts sigmoid everywhere.
+      (2) FULL-RANK gate W_g (`gate_rank=None`) — this is the K3 change. Kimi
+          Linear factorized the gate as W↑g W↓g "to ensure a fair parameter
+          comparison" against its full-attention baseline; K3 §2.1.1 ("Full-rank
+          gate") drops the factorization for "an input-dependent full-rank
+          projection". Pass an int `gate_rank` to get the old Kimi Linear
+          low-rank gate back.
 
-    The gate is produced INSIDE the norm from the block input x, so the call site in
-    your layer collapses to `O = self.o_norm(O_heads, x)` (no separate gate_proj).
+    The gate is produced INSIDE the norm from the block input x, so the call site
+    collapses to `O = self.o_norm(O_heads, x)` (no separate gate_proj).
     """
 
     def __init__(
@@ -145,15 +173,22 @@ class GatedRMSNorm(nnx.Module):
         head_dim: int,
         d_model: int,
         inner_dim: int,
-        gate_rank: int,
+        gate_rank: int | None = None,
         *,
         eps: float = 1e-5,
         rngs: nnx.Rngs,
     ):
         self.norm = RMSNorm(head_dim, eps=eps)
-        self.gate = LowRankLinear(
-            d_model, gate_rank, inner_dim, use_bias=False, rngs=rngs
-        )
+        if gate_rank is None:
+            # K3 Eq. 6: W_g is a single full-rank projection d_model -> inner_dim.
+            self.gate = nnx.Linear(
+                d_model, inner_dim, use_bias=False, kernel_init=_XAVIER, rngs=rngs
+            )
+        else:
+            # Kimi Linear's low-rank W↑g W↓g factorization (kept for comparison).
+            self.gate = LowRankLinear(
+                d_model, gate_rank, inner_dim, use_bias=False, rngs=rngs
+            )
 
     def __call__(self, O_heads: jax.Array, x: jax.Array) -> jax.Array:
         """O_heads: [B, L, Hv, dv]   x: [B, L, d_model]  ->  [B, L, Hv*dv]."""
@@ -162,8 +197,8 @@ class GatedRMSNorm(nnx.Module):
         o = O_heads.astype(F32)  # [B,L,Hv,dv] -> fp32 for RMSNorm
         o = self.norm(o)  # head-wise RMSNorm
 
-        g = self.gate(x).astype(F32)  # low-rank gate
-        g = jax.nn.sigmoid(g)  # low-rank SIGMOID gate
+        g = self.gate(x).astype(F32)  # W_g x  (full-rank by default, K3 Eq. 6)
+        g = jax.nn.sigmoid(g)  # Sigmoid(W_g x)
         g = g.reshape(B, L, Hv, dv)
 
         return (o * g).reshape(B, L, Hv * dv)
@@ -253,6 +288,9 @@ class GatedDeltaNet2(nnx.Module):
         #   have no decay-range limit if the learned decay outgrows the centered
         #   core's per-chunk |G_C| ~ 176 (see chunkwise_gated_delta_rule_2)
         sub_chunk_size: int = 16,  # c for core="subchunking"; ignored otherwise
+        decay_mode: str = "bounded_sigmoid",  # K3 Eq. 5 (default) | "softplus" = GDN-2/Kimi Linear
+        decay_min: float = -5.0,  # g_min for the bounded mapping; K3 fixes -5
+        output_gate_rank: int | None = None,  # None = full-rank W_g (K3 Eq. 6)
         *,
         rngs: nnx.Rngs,
     ):
@@ -275,6 +313,11 @@ class GatedDeltaNet2(nnx.Module):
         self.expanded_erase = expanded_erase
         self.core = core
         self.sub_chunk_size = sub_chunk_size
+        if decay_mode not in ("bounded_sigmoid", "softplus"):
+            raise ValueError(
+                f"decay_mode must be 'bounded_sigmoid' or 'softplus', got {decay_mode!r}")
+        self.decay_mode = decay_mode
+        self.decay_min = decay_min
 
         # App. C.1 projection shapes: erase/key side -> H·d_k, write/value side -> H_v·d_v.
         k_proj_dim = self.H * self.dk  # q, k, b live on the key-head axis
@@ -335,18 +378,28 @@ class GatedDeltaNet2(nnx.Module):
         self.k_conv = ShortConv(k_proj_dim, conv_size, rngs=rngs)
         self.v_conv = ShortConv(v_proj_dim, conv_size, rngs=rngs)
 
-        # Log-decay parameters (Eq. 12 / 86; App. C.1): 'a' is stored PER KEY
-        # HEAD ([H]) and broadcast across the d_k channels of that head; the
-        # bias δ is stored per key channel ([H·d_k]) and added pre-softplus.
-        # Init follows the Gated DeltaNet family recipe App. D.5 refers to:
-        #   a = log U(1, 16)  -> exp(a) ∈ [1, 16], a spread of per-head
-        #                        base forgetting rates;
-        #   δ = softplus⁻¹(dt), dt log-uniform in [1e-3, 1e-1] -> the decay
-        #       magnitude at init (where Proj_f x ≈ 0) is small: long memory,
-        #       with a spread of time scales across channels.
+        # Log-decay parameters. 'A' is stored PER KEY HEAD ([H]) and broadcast
+        # across that head's d_k channels; the bias δ (K3's b^h_α) is stored per
+        # key channel ([H·d_k]) and added to the low-rank decay logit.
+        #
+        # A's INIT depends on the mapping (see _project for the two formulas):
+        #   * "softplus"        g = -exp(A)·softplus(z)  — GDN-2 / Kimi Linear.
+        #     A = log U(1, 16) -> exp(A) ∈ [1, 16], a spread of per-head base
+        #     forgetting rates (the Gated DeltaNet family recipe, App. D.5).
+        #   * "bounded_sigmoid" g = g_min·Sigmoid(exp(A)·z)  — K3 Eq. 5, which
+        #     states "We initialize A_h = 0", i.e. unit slope for every head;
+        #     the spread now comes from the learned per-channel logits instead.
         self.A_log = nnx.Param(
-            jnp.log(jax.random.uniform(rngs.params(), (self.H,), F32, 1.0, 16.0))
-        )  # 'a' in -exp(a)·softplus(·)
+            jnp.zeros((self.H,), F32)
+            if decay_mode == "bounded_sigmoid"
+            else jnp.log(jax.random.uniform(rngs.params(), (self.H,), F32, 1.0, 16.0))
+        )
+        # δ = softplus⁻¹(dt), dt log-uniform in [1e-3, 1e-1]. K3 Eq. 2/5 keeps
+        # this init ("each bias b^h_α is initialized following [Kimi Linear,
+        # Mamba-2, GDN]"), and it means the same thing under both mappings: with
+        # Proj_f x ≈ 0 at init the logit is z ≈ δ ≪ 0, so softplus(z) ≈ e^δ ≈ dt
+        # and Sigmoid(z) ≈ e^δ ≈ dt alike — a small per-token decay, i.e. long
+        # memory, with a spread of time scales across channels.
         dt = jnp.exp(
             jax.random.uniform(
                 rngs.params(),
@@ -363,7 +416,7 @@ class GatedDeltaNet2(nnx.Module):
             head_dim=self.dv,
             d_model=d_model,
             inner_dim=self.Hv * self.dv,
-            gate_rank=self.dv,
+            gate_rank=output_gate_rank,  # None -> K3's full-rank W_g (Eq. 6)
             rngs=rngs,
         )
 
@@ -459,15 +512,42 @@ class GatedDeltaNet2(nnx.Module):
         q = q * jax.lax.rsqrt(jnp.sum(q * q, axis=-1, keepdims=True) + 1e-6)
         k = k * jax.lax.rsqrt(jnp.sum(k * k, axis=-1, keepdims=True) + 1e-6)
 
-        # Log-decay branch, computed in fp32 outside the kernel (Eq. 12 / 86; App. C.1 / D.1).
-        #   g_t = -exp(a) ⊙ softplus(Proj_f(x_t) + δ),  then α_t = exp(g_t) inside the core.
-        f_p = self.f_proj(x).astype(jnp.float32)  # [B,L,H*dk]  Proj_f(x) in Eq. 86
-        d_t = self.dt_bias[...].astype(jnp.float32)  # [H*dk]  per-channel bias δ, Eq. 86
-        a_l = self.A_log[...].astype(jnp.float32)  # [H]  'a', per key head (App. C.1)
+        # ---- Log-decay branch, computed in fp32 outside the kernel ------------
+        # The DECAY LOGIT is the same in both papers (K3 Eq. 2): a low-rank
+        # projection of x plus a per-key-channel bias,
+        #     z_t = W↑_α W↓_α x_t + b_α        (this repo's `f_proj` + `dt_bias`)
+        # What K3 changes is the MAPPING from that logit to the per-step
+        # log-decay g_t (α_t = exp(g_t) is formed inside the core).
+        f_p = self.f_proj(x).astype(jnp.float32)  # [B,L,H*dk]  W↑_α W↓_α x
+        d_t = self.dt_bias[...].astype(jnp.float32)  # [H*dk]  per-channel bias b_α
+        a_l = self.A_log[...].astype(jnp.float32)  # [H]  per-head log-scale A
 
-        f = self._split_k(f_p + d_t, B, L)  # Proj_f(x)+δ -> [B,H,L,dk]
-        a = jnp.exp(a_l)[None, :, None, None]  # exp(a), broadcast over the d_k channels
-        g = -a * jax.nn.softplus(f)  # [B,H,L,dk] ≤ 0  (Eq. 86)
+        z = self._split_k(f_p + d_t, B, L)  # z_t -> [B,H,L,dk]
+        a = jnp.exp(a_l)[None, :, None, None]  # exp(A), broadcast over the d_k channels
+
+        if self.decay_mode == "bounded_sigmoid":
+            # K3 Eq. 5 — LOWER-BOUNDED decay:
+            #     g_t = g_min · Sigmoid(exp(A) z_t) ∈ (g_min, 0)
+            #     α_t = exp(g_t)                   ∈ (e^{g_min}, 1)
+            # WHY. The chunkwise form rescales keys by the reciprocal cumulative
+            # decay 1/Γ (core.py's K̄ = exp(-G) ⊙ K). Under the old unbounded
+            # mapping a chunk's cumulative log-decay G_C can go arbitrarily
+            # negative, so that reciprocal can overflow — which is exactly why
+            # core.py needs the "centered"/"pairwise"/"subchunking" tricks and
+            # why Kimi Linear had to compute its diagonal 16-token tiles with an
+            # explicit position-pair path instead of dense matmuls.
+            # With g_min = -5, every retention factor satisfies α > e^-5 ≈ 6.7e-3,
+            # so the cumulative log-decay over a 16-token tile lies in (-80, 0)
+            # and the reciprocal stays below e^80 — inside the BF16 range. That
+            # bound is what lets K3 run EVERY causal tile as a dense Tensor-Core
+            # matmul (Fig. 3b), and here it means the default "centered" core
+            # (safe to |G_C| ≈ 176) is comfortably in range for chunk_size ≤ 35
+            # even in the worst case of full decay on every token.
+            g = self.decay_min * jax.nn.sigmoid(a * z)
+        else:
+            # GDN-2 / Kimi Linear (GDN Eq. 86, Mamba-2 lineage): the unbounded
+            # negative-softplus mapping, g_t = -exp(A) ⊙ softplus(z_t) ∈ (-∞, 0).
+            g = -a * jax.nn.softplus(z)  # [B,H,L,dk] ≤ 0
 
         # Channel-wise gates (Eq. 11 / 85).
         b = jax.nn.sigmoid(self.b_proj(x))  # b = σ(Proj_b x) ∈ [0,1]^{d_k}

@@ -1,14 +1,23 @@
-"""NoPE Multi-head Latent Attention (MLA) — the FULL-attention token mixer.
+"""NoPE Gated Multi-head Latent Attention (MLA) — the FULL-attention token mixer.
 
-In the Kimi Linear hybrid (Sec. 3 of the paper), 1 of every 4 layers is ordinary
-softmax attention; this module is that layer, in Kimi Linear's exact flavor:
+In the Kimi K3 hybrid (§2.1), each block is 3 linear-attention layers followed by
+1 Gated MLA layer, plus one extra Gated MLA at the very end of the backbone; this
+module is that full-attention layer, in K3's exact flavor:
 
   * MLA (DeepSeek-V2 lineage): keys/values live in a small shared low-rank LATENT,
     so the decode-time cache stores one latent vector per position instead of full
     K and V — the whole point of MLA is that tiny KV cache.
-  * NoPE — NO positional encoding of any kind. The GDN-2 linear layers already
-    encode position implicitly through their recurrence, so Kimi Linear drops RoPE
-    from its full-attention layers entirely (paper Sec. 3.3, "NoPE").
+  * NoPE — NO positional encoding of any kind (K3 §2.1.2). The linear-attention
+    layers already encode position implicitly through their recurrence, so the
+    MLA layers are freed to do pure global content matching. K3 notes the second
+    benefit: with no positional parameters there is nothing to retune when
+    extending context (no RoPE base rescaling, no YaRN) — it extrapolates to 1M
+    tokens directly.
+  * GATED (K3 §2.1.2, Eq. 7): an input-dependent, channel-wise FULL-RANK output
+    gate, y_t = W_o[Sigmoid(W_g x_t) ⊙ õ_t]. This is new in K3 — Kimi Linear's
+    MLA layers were ungated — and matches the full-rank gate K3 also adopts for
+    its linear layers, letting each token modulate which channels it reads out of
+    global attention.
   * Written in the ABSORBED form (see the class docstring): with no RoPE in the
     way, the K/V up-projections fold into the neighboring matrices exactly, so the
     latent itself serves as both K and V and never gets up-projected at runtime.
@@ -55,6 +64,8 @@ class GroupedQueryLatentAttention(nnx.Module):
         w_dkv  : W_DKV          -> down-projects x to the shared KV latent (c_kv).
         w_uv_o : W_UV . W_O     -> up-projects the value latent and applies the
                                   output projection in a single matmul.
+        w_gate : W_g            -> K3 Eq. 7's full-rank output gate, applied to
+                                  the value-latents just before w_uv_o.
 
     Key consequence: because there is no RoPE, W_UK and W_UV can be absorbed away
     *exactly*, and in the compressed latent space the keys and the values are the
@@ -72,6 +83,7 @@ class GroupedQueryLatentAttention(nnx.Module):
         head_dim: int,
         rngs: nnx.Rngs,
         compute_dtype: jnp.dtype = F32,
+        output_gate: bool = True,  # K3 Eq. 7; False = Kimi Linear's ungated MLA
     ):
         # Matmul dtype for the projections (bf16 on H200); the QK^T / softmax / AV
         # core is upcast to fp32 below regardless, for a stable attention distribution.
@@ -116,6 +128,7 @@ class GroupedQueryLatentAttention(nnx.Module):
         )
 
         # W_UV . W_O absorbed: value-latent -> up-projected, output-projected.
+        # This plays the role of W_o in K3 Eq. 7.
         self.w_uv_o = nnx.Linear(
             d_q,
             embed_dim,
@@ -125,6 +138,36 @@ class GroupedQueryLatentAttention(nnx.Module):
             param_dtype=F32,
             rngs=rngs,
         )
+
+        # W_g of K3 Eq. 7: the FULL-RANK output gate. It reads the block input x
+        # (not the attention output), so the modulation is input-dependent, and
+        # it lives on the d_q axis — i.e. it gates the per-head value-latents
+        # BEFORE the absorbed W_UV·W_O, which is where the "ungated MLA output"
+        # õ_t of Eq. 7 sits in this factorization.
+        self.w_gate = (
+            nnx.Linear(
+                embed_dim,
+                d_q,
+                use_bias=False,
+                kernel_init=_XAVIER,
+                dtype=compute_dtype,
+                param_dtype=F32,
+                rngs=rngs,
+            )
+            if output_gate
+            else None
+        )
+
+    def _gated_out(self, o_tilde: jax.Array, x: jax.Array) -> jax.Array:
+        """K3 Eq. 7:  y_t = W_o[ Sigmoid(W_g x_t) ⊙ õ_t ].
+
+        o_tilde: [B, L, Hq*Dh] — the concatenated value-latents (the ungated MLA
+        output in absorbed form).  x: [B, L, embed_dim] — the block input.
+        Shared by the training and streaming paths so they cannot drift apart.
+        """
+        if self.w_gate is not None:
+            o_tilde = jax.nn.sigmoid(self.w_gate(x)) * o_tilde
+        return self.w_uv_o(o_tilde)
 
     def __call__(self, x: jax.Array) -> jax.Array:
         # x: (B, T, embed_dim)
@@ -193,8 +236,9 @@ class GroupedQueryLatentAttention(nnx.Module):
             batch_size, seq_length, self.num_q_heads * self.head_dim
         )
 
-        # Absorbed W_UV . W_O: up-project the value latent and output-project.
-        output = self.w_uv_o(weighted_latents)  # (B, T, embed_dim)
+        # Output gate (K3 Eq. 7) + absorbed W_UV . W_O: up-project the value
+        # latent and output-project.
+        output = self._gated_out(weighted_latents, x)  # (B, T, embed_dim)
 
         return output
 
@@ -263,5 +307,5 @@ class GroupedQueryLatentAttention(nnx.Module):
             B, L, self.num_q_heads * self.head_dim
         )
 
-        output = self.w_uv_o(weighted)  # (B, L, embed_dim)
+        output = self._gated_out(weighted, x)  # (B, L, embed_dim)
         return output, MLACache(l_kv, new_pos)
