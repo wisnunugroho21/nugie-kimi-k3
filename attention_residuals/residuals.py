@@ -94,8 +94,8 @@ Full — a layer's token-mixer and channel-mixer outputs still land in the same
 block sum. Reaching true Full would mean closing after every `add`.)
 
 The final output layer then aggregates all N block representations — i.e. one
-more read, with its own pseudo-query, over the closed blocks (see
-`AttnResBus.close_block` + a final `AttnResQuery` in the model).
+more read, with its own pseudo-query, over the closed blocks plus the trailing
+partial one (see `KimiK3._head`, which owns an extra `AttnResReader`).
 
 BLOCK SIZING — and a 2× trap when porting from the papers
 ----------------------------------------------------------
@@ -149,12 +149,36 @@ against Full unless noted.
     Full, 1.750 Block), because block sums accumulate over many layers and so
     develop larger magnitude differences than individual outputs do.
 
+HOW THIS FILE IS ORGANIZED
+--------------------------
+It follows the original's Fig. 2 pseudocode line for line:
+
+  * `block_attn_res(blocks, partial_block, proj, norm)` is the paper's function
+    of the same name and signature — stack, norm, score, softmax, mix.
+  * `AttnResReader` bundles the (proj, norm) pair one module owns, i.e. the
+    paper's `attn_res_proj`/`attn_res_norm` and `mlp_res_proj`/`mlp_res_norm`.
+  * The state is the paper's pair `(blocks, hidden_states)`, threaded EXPLICITLY
+    through each layer's forward and returned as `(blocks, partial_block)` —
+    there is no mutable container. `DecoderLayer.__call__` in kimi_k3_gdn2.py
+    mirrors the pseudocode's `forward` statement for statement, including the
+    block-boundary check sitting BETWEEN the token mixer's read and the mixer
+    itself.
+
+Two consequences of that ordering worth internalizing:
+  * `blocks` starts EMPTY. b_0 = h_1 enters as the very first boundary append,
+    because layer 0 satisfies `layer_idx % block_size == 0` and its incoming
+    partial is the token embedding. That is the whole mechanism by which "the
+    token embedding is always included as a source" holds.
+  * `partial_block` is never None at a read. It is set to None only between the
+    boundary append and the token mixer's output, and both reads happen outside
+    that window — which is why `block_attn_res` needs no empty-partial case.
+
 STREAMING
 ---------
 AttnRes attends across LAYERS, not across tokens, so all of its state lives
 inside a single forward pass. There is no cache to carry between decode steps —
-which is why `AttnResBus` is a plain Python object and not part of GDN2Cache /
-MLACache.
+which is why `blocks`/`partial_block` are ordinary values threaded through the
+call and not part of GDN2Cache / MLACache.
 """
 
 from __future__ import annotations
@@ -166,36 +190,100 @@ import jax.numpy as jnp
 F32 = jnp.float32
 
 
-def _rms_normalize(x: jax.Array, eps: float = 1e-6) -> jax.Array:
-    """RMSNorm WITHOUT a learnable gain, as used inside the AttnRes kernel φ.
+class RMSNorm(nnx.Module):
+    """The `norm: RMSNorm` argument of Fig. 2 — applied to the KEYS inside φ.
 
-    Eq. 2/9 writes φ(q, k) = exp(qᵀ RMSNorm(k)) and specifies no gain vector; a
-    per-channel gain here would in any case be redundant with the learnable
-    pseudo-query q it is dotted against (the two multiply channel-wise before
-    the sum, so q can absorb it). Keeping it gain-free also means the score is
-    purely about the DIRECTION of each source, which is the stated purpose.
+    Defined locally rather than imported so this package stands alone as a
+    readable transcription of the paper.
 
-    Not optional: the original ablates it away and loses 1.737 -> 1.743 on Full
-    AttnRes and 1.746 -> 1.750 on Block. Block suffers more because its sources
-    are SUMS over many layers, so their magnitudes diverge further than
-    individual layer outputs do — and an unnormalized dot product would then let
-    the largest block win the softmax on magnitude rather than on content.
+    It carries a LEARNABLE GAIN, because the pseudocode types it as an RMSNorm
+    module and §5 counts "one RMSNorm and one pseudo-query vector per layer"
+    among the parameters AttnRes adds. Note the gain is mathematically
+    absorbable: g ⊙ RMSNorm(k) dotted with w equals RMSNorm(k) dotted with
+    g ⊙ w, and there is only ONE query per reader, so the gain adds no
+    expressive power — it changes the parameterization (and hence the optimizer
+    geometry), not the function class.
+
+    Why it is here at all: without it, a source whose magnitude happens to be
+    large wins every dot product regardless of content. Ablating it costs
+    1.737 -> 1.743 on Full AttnRes and 1.746 -> 1.750 on Block; Block suffers
+    more because its sources are SUMS over many layers, whose magnitudes diverge
+    further than individual layer outputs do.
+
+    EXPECT ZERO GRADIENT ON THE GAIN AT STEP 0 — this is not a bug, it is the two
+    paper-mandated choices interacting. The gain reaches the loss only through
+    `logits = einsum(w, norm(V))`, so ∂logits/∂gain = w ⊙ k̂; with the required
+    zero-init on w, that is identically zero. The gain starts moving as soon as
+    w does (measured here: all gains zero at init, all but the first receiving
+    gradient two steps later). It is another sign the gain is doing no work the
+    query could not do — see the absorption argument above.
     """
-    return x * jax.lax.rsqrt(jnp.mean(x * x, axis=-1, keepdims=True) + eps)
+
+    def __init__(self, dim: int, *, eps: float = 1e-6):
+        self.eps = eps
+        self.weight = nnx.Param(jnp.ones((dim,), F32))
+
+    def __call__(self, x: jax.Array) -> jax.Array:
+        xf = x.astype(F32)
+        rms = jax.lax.rsqrt(jnp.mean(xf * xf, axis=-1, keepdims=True) + self.eps)
+        return xf * rms * self.weight[...]
 
 
-class AttnResQuery(nnx.Module):
-    """One module's learnable pseudo-query w_l (Eq. 3/8), plus the read it performs.
+def block_attn_res(
+    blocks: list[jax.Array],
+    partial_block: jax.Array,
+    proj: nnx.Linear,
+    norm: RMSNorm,
+) -> jax.Array:
+    """Inter-block attention: attend over block reps + partial sum. (Fig. 2)
+
+    Args:
+      blocks:        N tensors of shape [B, T, D] — completed block
+                     representations for each previous block.
+      partial_block: [B, T, D] — the intra-block partial sum b_n^i.
+      proj:          the pseudo-query w_l, stored as a d->1 Linear so it can be
+                     read off as `proj.kernel.squeeze()` (the paper stores it the
+                     same way, as `proj.weight.squeeze()`).
+      norm:          RMSNorm applied to the keys.
+
+    Returns h_l: [B, T, D] — Eq. 4/9's Σ_i α_{i→l} · v_i.
+
+    The value matrix is exactly Eq. 6/10: the closed blocks, plus the open
+    block's running partial sum as one extra source. Keys and values are the
+    SAME tensors (Eq. 3/8), the difference being that only the key side is
+    normalized — so the scores compare directions while the mixture preserves
+    the sources' true magnitudes.
+
+    `blocks` may be EMPTY, which happens exactly once: the very first module of
+    the network, before layer 0's boundary has closed the embedding into b_0.
+    The stack is then length 1 and the softmax over it is identically 1, so this
+    returns `partial_block` unchanged — correct (with one source there is nothing
+    to select) and requiring no special case. Its one visible consequence is that
+    that reader's query and gain are structurally unused and keep an exactly zero
+    gradient forever; every other reader trains normally.
+    """
+    V = jnp.stack([*blocks, partial_block])  # [N+1, B, T, D]
+    K = norm(V)  # keys only — values stay raw
+
+    # φ(q, k) = exp(qᵀ RMSNorm(k)), normalized over the N+1 sources. softmax
+    # supplies both the exp and the denominator of Eq. 2/9 in one stable step
+    # (it subtracts the max, which cancels in the ratio). fp32 throughout: the
+    # source count is tiny but the exponential is not forgiving in bf16.
+    logits = jnp.einsum("d, n b t d -> n b t", proj.kernel[...].squeeze(-1).astype(F32), K)
+    h = jnp.einsum("n b t, n b t d -> b t d", jax.nn.softmax(logits, axis=0), V.astype(F32))
+    return h.astype(partial_block.dtype)
+
+
+class AttnResReader(nnx.Module):
+    """The (proj, norm) pair belonging to ONE module — Fig. 2's `attn_res_proj` /
+    `attn_res_norm` (and the `mlp_res_*` twin).
 
     ONE PER MODULE, NOT PER LAYER. Each token mixer AND each channel mixer owns
-    its own query and reads the bus independently — they can, and do, attend to
+    its own reader and attends independently — they can, and do, land on
     different sources. K3's Fig. 2 shows this by hanging an (α, w) pair off every
-    KDA / Gated MLA / Stable LatentMoE box; the original's pseudocode makes it
-    explicit by carrying separate `attn_res_proj`/`attn_res_norm` and
-    `mlp_res_proj`/`mlp_res_norm` per transformer layer. (The original's prose
-    saying "one RMSNorm and one pseudo-query vector w_l per layer" is consistent
-    with this — "layer" there means module, which is why it counts its 27
-    transformer blocks as 54 layers.)
+    KDA / Gated MLA / Stable LatentMoE box. (The original's prose saying "one
+    RMSNorm and one pseudo-query vector w_l per layer" agrees: "layer" there
+    means module, which is why it counts 27 transformer blocks as 54 layers.)
 
     ZERO-INIT IS REQUIRED, not merely tidy. The original (§5) states it flatly:
     "Crucially, all pseudo-query vectors must be initialized to zero." Every
@@ -207,115 +295,21 @@ class AttnResQuery(nnx.Module):
     before the layer outputs mean anything.
     """
 
-    def __init__(self, d_model: int):
-        self.w = nnx.Param(jnp.zeros((d_model,), F32))
+    def __init__(self, d_model: int, *, eps: float = 1e-6, rngs: nnx.Rngs):
+        # w_l as a d->1 projection, matching the paper's storage. `rngs` is
+        # accepted for call-site parity with the other nnx modules but never
+        # consumed: the kernel init is deterministically zero.
+        self.proj = nnx.Linear(
+            d_model,
+            1,
+            use_bias=False,
+            kernel_init=nnx.initializers.zeros_init(),
+            rngs=rngs,
+        )
+        self.norm = RMSNorm(d_model, eps=eps)
 
-    def __call__(self, bus: "AttnResBus") -> jax.Array:
-        """Read the bus with this module's pseudo-query -> h_l: [B, L, d_model]."""
-        return bus.read(self.w[...])
+    def __call__(
+        self, blocks: list[jax.Array], partial_block: jax.Array
+    ) -> jax.Array:
+        return block_attn_res(blocks, partial_block, self.proj, self.norm)
 
-
-class AttnResBus:
-    """The set of depth-sources visible right now, and the block bookkeeping.
-
-    NOT an nnx.Module: it holds intermediate ACTIVATIONS for one forward pass
-    (the b_n's), never parameters, and it is rebuilt from scratch on every call.
-    The learnable part of AttnRes lives entirely in the per-module
-    `AttnResQuery` vectors.
-
-    Usage inside a model's forward (see KimiK3.__call__):
-
-        bus = AttnResBus(embedding, block_size=cfg.attnres_block_size)
-        for layer in layers:
-            h = layer.q_attn(bus)          # Eq. 9/10 read
-            f = layer.token_mixer(norm(h))
-            bus.add(f)                     # contribute to the open block's sum
-            ...same for the channel mixer...
-            bus.end_layer()                # closes the block every `block_size` layers
-        bus.close_block()                  # flush a trailing partial block
-        x = final_query(bus)               # "the final output layer aggregates all N blocks"
-    """
-
-    def __init__(self, embedding: jax.Array, block_size: int):
-        if block_size <= 0:
-            raise ValueError(f"block_size must be positive, got {block_size}")
-        self.block_size = block_size
-
-        # Closed block representations [b_0, b_1, …]. b_0 = h_1, the token
-        # embedding (Eq. 10: "we set b_0 = h_1 so the token embedding is always
-        # included as a source").
-        self.blocks: list[jax.Array] = [embedding]
-
-        # b_n^i, the running partial sum of the block currently open. None means
-        # the block is still empty — which is exactly the i = 1 case of Eq. 10,
-        # where the value matrix contains only the closed blocks.
-        self.partial: jax.Array | None = None
-
-        self._layers_in_block = 0
-
-    # ---- the read (Eqs. 9 / 10) ------------------------------------------- #
-    def read(self, q: jax.Array) -> jax.Array:
-        """Depth-attention with pseudo-query `q` [d_model] -> [B, L, d_model].
-
-        Sources are the closed blocks plus (if non-empty) the open block's
-        partial sum — precisely the value matrix V of Eq. 10.
-        """
-        sources = self.blocks if self.partial is None else [*self.blocks, self.partial]
-
-        # First module of the network: b_0 is the only source, and a softmax over
-        # one entry is 1. Short-circuit — this is not an approximation, it is the
-        # same value without building a length-1 attention.
-        # (Consequence worth knowing: the very first module's pseudo-query is
-        # then structurally unused and gets an exactly zero gradient. That is the
-        # correct answer — with one source there is nothing to choose — not a
-        # wiring bug.)
-        if len(sources) == 1:
-            return sources[0]
-
-        V = jnp.stack(sources, axis=-2)  # [B, L, S, d]  values v_i (un-normalized)
-
-        # φ(q, k) = exp(qᵀ RMSNorm(k)); the softmax below supplies the exp and the
-        # normalization of Eq. 9 in one numerically stable step (it subtracts the
-        # row max, which cancels in the ratio). Scores in fp32: S is small but the
-        # exponential is not forgiving in bf16.
-        scores = jnp.einsum("...sd,d->...s", _rms_normalize(V.astype(F32)), q.astype(F32))
-        alpha = jax.nn.softmax(scores, axis=-1)  # α_{i→l}: [B, L, S]
-
-        # h_l = Σ_i α_{i→l} · v_i — mixing the RAW values, per Eq. 9.
-        h = jnp.einsum("...s,...sd->...d", alpha, V.astype(F32))
-        return h.astype(V.dtype)
-
-    # ---- the write side ---------------------------------------------------- #
-    def add(self, f_out: jax.Array) -> None:
-        """Accumulate a module's output f_l(h_l) into the open block's sum b_n."""
-        self.partial = f_out if self.partial is None else self.partial + f_out
-
-    def end_layer(self) -> None:
-        """Mark one decoder layer done; close the block every `block_size` layers.
-
-        TIMING, vs the original's pseudocode. It closes the block at the START of
-        the boundary layer — after that layer's token-mixer read, before the mixer
-        runs — whereas this closes at the END of the preceding layer. The two are
-        EQUIVALENT, not merely similar: in their ordering the boundary layer's
-        read sees [b_0 … b_{n-1}] + partial where partial is already the complete
-        block sum, i.e. the same set {b_0 … b_n} this ordering supplies as closed
-        blocks. Only the bookkeeping differs, and closing at the end keeps
-        `read` free of any is-this-a-boundary special case.
-        """
-        self._layers_in_block += 1
-        if self._layers_in_block >= self.block_size:
-            self.close_block()
-
-    def close_block(self) -> None:
-        """Freeze the open block into a new source b_n. Idempotent when empty, so
-        it is safe to call once more at the end to flush a trailing partial block
-        (K3's 93 layers / 12 per block leave exactly such a partial block)."""
-        if self.partial is not None:
-            self.blocks.append(self.partial)
-            self.partial = None
-        self._layers_in_block = 0
-
-    @property
-    def num_sources(self) -> int:
-        """How many b's a read would currently see (diagnostics / tests)."""
-        return len(self.blocks) + (0 if self.partial is None else 1)

@@ -44,14 +44,18 @@ See gated_deltanet_2/layer.py for both.
 BLOCK STRUCTURE — NOT the usual pre-norm residual
 --------------------------------------------------
 The familiar `x = x + Mixer(Norm(x))` is gone. Under AttnRes each module reads
-its own input from the depth-attention bus and contributes its output back:
+its own input by ATTENDING over the depth sources, and its output is accumulated
+into the current block's running sum rather than into its own input:
 
-    h = q_attn(bus);  bus.add( TokenMixer(  RMSNorm(h) ) )   # linear OR Gated MLA
-    h = q_ffn(bus);   bus.add( ChannelMixer(RMSNorm(h) ) )   # Stable LatentMoE
+    h = attn_res(blocks, partial);  partial += TokenMixer(  RMSNorm(h) )
+    h = mlp_res( blocks, partial);  partial += ChannelMixer(RMSNorm(h) )
 
-There is no additive residual because the read itself is a softmax mixture over
-sources that always include the token embedding — the network can choose a
-residual-like read, it just is not hardwired to one.
+with `(blocks, partial)` threaded through the layers — `DecoderLayer.__call__`
+transcribes the AttnRes paper's Fig. 2 pseudocode statement for statement,
+including the block-boundary check that sits between the first read and the
+token mixer. There is no additive residual because the read itself is a softmax
+mixture over sources that always include the token embedding: the network can
+choose a residual-like read, it just is not hardwired to one.
 
 MODEL = Embed -> [DecoderLayer] * n_layers -> AttnRes read -> RMSNorm -> LM head.
 
@@ -83,7 +87,7 @@ import jax.numpy as jnp
 from jax.typing import ArrayLike
 
 # Reuse the building blocks already implemented and verified in this repo.
-from attention_residuals import AttnResBus, AttnResQuery
+from attention_residuals import AttnResReader
 from gated_deltanet_2.layer import GatedDeltaNet2, GDN2Cache, RMSNorm
 from multi_latent_attention.attention import GroupedQueryLatentAttention, MLACache
 from multi_latent_attention.moe import DenseFFN, StableLatentMoE
@@ -229,12 +233,20 @@ class DecoderLayer(nnx.Module):
         is_last = layer_idx == cfg.n_layers - 1
         self.is_full_attn = is_block_end or is_last
 
-        # AttnRes pseudo-queries (§2.2, Eq. 8). Fig. 2 hangs an (α, w) pair off
-        # every module, so the token mixer and the channel mixer each get one —
-        # they read the depth bus independently and can attend to different
-        # sources.
-        self.q_attn = AttnResQuery(cfg.d_model)
-        self.q_ffn = AttnResQuery(cfg.d_model)
+        # AttnRes readers (§2.2). Fig. 2 hangs an (α, w) pair off every module,
+        # so the token mixer and the channel mixer each get one — they read the
+        # depth sources independently and can attend to different ones. Named
+        # after the pseudocode's attn_res_* / mlp_res_* pairs.
+        self.attn_res = AttnResReader(cfg.d_model, rngs=rngs)
+        self.mlp_res = AttnResReader(cfg.d_model, rngs=rngs)
+
+        # Block boundary, decided once at construction so the forward has no
+        # traced branch. The pseudocode writes this as
+        #     layer_number % (block_size // 2) == 0
+        # where its block_size counts MODULES; attnres_block_size already counts
+        # decoder layers, so the //2 is folded in. Note layer 0 is a boundary:
+        # that is what appends the token embedding as b_0.
+        self.starts_new_block = layer_idx % cfg.attnres_block_size == 0
 
         # Pre-norm before the token mixer (the "Norm" boxes inside the modules of
         # Fig. 2). RMSNorm reused from the GDN-2 layer.
@@ -305,37 +317,71 @@ class DecoderLayer(nnx.Module):
                 rngs=rngs,
             )
 
-    def __call__(self, bus: AttnResBus) -> dict[str, jax.Array]:
-        """Run both mixers against the AttnRes bus. Returns the channel mixer's
-        aux dict (MoE diagnostics; empty for a dense layer).
+    def __call__(
+        self, blocks: list[jax.Array], hidden_states: jax.Array
+    ) -> tuple[list[jax.Array], jax.Array, dict[str, jax.Array]]:
+        """One layer, following the AttnRes paper's Fig. 2 `forward` statement for
+        statement.
 
-        Note what is NOT here: no `x = x + ...`. Each module's input comes from
-        `bus.read` (Eq. 9/10) and its output goes back via `bus.add`, which
-        accumulates into the current block's running sum b_n.
+        blocks:        the completed block representations [b_0, …, b_{n-1}].
+        hidden_states: the incoming intra-block partial sum b_n^i.
+        Returns (blocks, partial_block, aux) — aux is the channel mixer's MoE
+        diagnostics, empty for a dense layer.
+
+        Note what is NOT here: no `x = x + ...` against a residual stream. Each
+        module's input is an attention read over the depth sources, and its
+        output is accumulated into the OPEN BLOCK's sum, not into its own input.
         """
-        # --- token mixing ---
-        h = self.q_attn(bus)  # h_l = Σ_i α_{i→l} v_i
-        bus.add(self.token_mixer(self.norm1(h)))  # contribute f_l(h_l) to b_n
+        partial_block = hidden_states
 
-        # --- channel mixing ---
-        h = self.q_ffn(bus)  # a fresh read: b_n now includes the token mixer
+        # apply block attnres before the token mixer
+        h = self.attn_res(blocks, partial_block)
+
+        # if reaches block boundary, start new block. This sits BETWEEN the read
+        # and the mixer, exactly as in Fig. 2: the read above still sees the
+        # finished block as `partial_block`, and closing it here just moves it
+        # into `blocks` before the new block starts accumulating. On layer 0 the
+        # partial being closed IS the token embedding — that is how b_0 = h_1
+        # becomes a permanent source.
+        if self.starts_new_block:
+            blocks = [*blocks, partial_block]
+            partial_block = None
+
+        # token mixer (KDA in the paper; GDN-2 or Gated MLA here)
+        f = self.token_mixer(self.norm1(h))
+        partial_block = partial_block + f if partial_block is not None else f
+
+        # apply block attnres before the channel mixer — a FRESH read, which now
+        # also sees the token mixer's contribution inside the open block
+        h = self.mlp_res(blocks, partial_block)
+
+        # channel mixer (Stable LatentMoE, or a dense FFN on the first layers)
         m, aux = self.channel_mixer(self.norm2(h))
-        bus.add(m)
+        partial_block = partial_block + m
 
-        bus.end_layer()  # closes the AttnRes block every `attnres_block_size` layers
-        return aux
+        return blocks, partial_block, aux
 
     def init_cache(self, batch_size: int, max_len: int, dtype=jnp.float32):
         """Per-layer streaming cache: a GDN2Cache (linear layer) or MLACache (MLA)."""
         return self.token_mixer.init_cache(batch_size, max_len, dtype)
 
     def step(
-        self, bus: AttnResBus, cache: GDN2Cache | MLACache
-    ) -> tuple[GDN2Cache | MLACache, dict[str, jax.Array]]:
-        """Streaming forward for one layer. Same structure as __call__; only the
-        token mixer is stateful (the channel mixer is position-wise, and AttnRes
-        state lives inside this single forward pass)."""
-        h = self.norm1(self.q_attn(bus))
+        self,
+        blocks: list[jax.Array],
+        hidden_states: jax.Array,
+        cache: GDN2Cache | MLACache,
+    ) -> tuple[list[jax.Array], jax.Array, GDN2Cache | MLACache]:
+        """Streaming forward for one layer. Identical AttnRes bookkeeping to
+        __call__; only the token mixer call differs (it threads a cache). The
+        channel mixer is position-wise and AttnRes state lives inside this single
+        forward pass, so neither needs one."""
+        partial_block = hidden_states
+
+        h = self.norm1(self.attn_res(blocks, partial_block))
+
+        if self.starts_new_block:
+            blocks = [*blocks, partial_block]
+            partial_block = None
 
         if isinstance(cache, GDN2Cache) and isinstance(self.token_mixer, GatedDeltaNet2):
             # GDN-2: fixed-size recurrent state (O(1) per token).
@@ -349,13 +395,12 @@ class DecoderLayer(nnx.Module):
             raise ValueError(
                 f"Cache type {type(cache)} does not match token mixer {type(self.token_mixer)}"
             )
-        bus.add(f)
+        partial_block = partial_block + f if partial_block is not None else f
 
-        m, aux = self.channel_mixer(self.norm2(self.q_ffn(bus)))
-        bus.add(m)
+        m, _ = self.channel_mixer(self.norm2(self.mlp_res(blocks, partial_block)))
+        partial_block = partial_block + m
 
-        bus.end_layer()
-        return new_cache, aux
+        return blocks, partial_block, new_cache
 
 
 # --------------------------------------------------------------------------- #
@@ -385,8 +430,8 @@ class KimiK3(nnx.Module):
 
         # §2.2: "The final output layer then aggregates all N block
         # representations" — one last AttnRes read, with its own pseudo-query,
-        # over the closed blocks.
-        self.q_out = AttnResQuery(cfg.d_model)
+        # over the closed blocks plus the trailing partial one.
+        self.out_res = AttnResReader(cfg.d_model, rngs=rngs)
 
         # Final pre-head norm + untied LM head (the DeepSeek/Moonshot line does
         # not tie weights; to tie, drop lm_head and use x @ embed.embedding.T).
@@ -402,11 +447,14 @@ class KimiK3(nnx.Module):
         )
 
     # ----------------------------------------------------------------------- #
-    def _head(self, bus: AttnResBus) -> jax.Array:
-        """Shared tail of __call__/step: close the last AttnRes block, perform the
-        final aggregation read, and apply the pre-head norm."""
-        bus.close_block()  # flush a trailing partial block (93 % 12 ≠ 0 in the paper)
-        return self.norm_f(self.q_out(bus))
+    def _head(self, blocks: list[jax.Array], partial_block: jax.Array) -> jax.Array:
+        """Shared tail of __call__/step: the final aggregation read + pre-head norm.
+
+        `partial_block` is the last block, still open — K3's 93 layers over
+        12-layer blocks leave exactly such a trailing partial. Passing it as the
+        partial argument of the read is what makes it the Nth representation, so
+        no explicit flush is needed."""
+        return self.norm_f(self.out_res(blocks, partial_block))
 
     def __call__(self, input_ids: jax.Array) -> tuple[jax.Array, dict[str, ArrayLike]]:
         """input_ids: int[B, L] -> (logits[B, L, vocab], aux).
@@ -426,17 +474,20 @@ class KimiK3(nnx.Module):
         group_sizes: list[ArrayLike] = []
         qb_bias: list[ArrayLike] = []
 
-        # b_0 = the token embedding; every module can attend back to it (Eq. 10).
-        bus = AttnResBus(self.embed(input_ids), self.cfg.attnres_block_size)
+        # AttnRes state, threaded through the layers as in Fig. 2's `forward`.
+        # `blocks` starts EMPTY: the embedding enters as b_0 when layer 0 hits
+        # its block boundary and closes the partial it was handed (Eq. 10).
+        blocks: list[jax.Array] = []
+        h = self.embed(input_ids)  # the initial partial block
 
         for layer in self.layers:
-            aux = layer(bus)
+            blocks, h, aux = layer(blocks, h)
             if aux:  # dense layers return {}
                 aux_loss = aux_loss + aux["aux_loss"]
                 group_sizes.append(aux["group_sizes"])
                 qb_bias.append(aux["qb_bias"])
 
-        x = self._head(bus)
+        x = self._head(blocks, h)
         # Upcast logits to fp32 for a numerically stable softmax/cross-entropy
         # under bf16 compute (the lm_head matmul itself runs in compute_dtype).
         logits = self.lm_head(x).astype(jnp.float32)  # [B, L, vocab]
@@ -466,12 +517,13 @@ class KimiK3(nnx.Module):
         or 1 per decoded token). Returns (logits[B, L, vocab], new_caches)."""
         new_caches = []
 
-        bus = AttnResBus(self.embed(input_ids), self.cfg.attnres_block_size)
+        blocks: list[jax.Array] = []
+        h = self.embed(input_ids)
         for layer, cache in zip(self.layers, caches):
-            new_cache, _ = layer.step(bus, cache)
+            blocks, h, new_cache = layer.step(blocks, h, cache)
             new_caches.append(new_cache)
 
-        x = self._head(bus)
+        x = self._head(blocks, h)
         return self.lm_head(x).astype(jnp.float32), new_caches
 
     def generate(
