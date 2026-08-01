@@ -675,7 +675,26 @@ class GatedDeltaNet2(nnx.Module):
         The prefill win is in SEQUENTIAL DEPTH: L/C scan steps instead of L,
         which is what dominates on accelerators. On CPU the recurrent scan is
         already compute-bound and the chunkwise core's pairwise-ratio tensor
-        costs O(L·C·dk), so there the chunkwise path only wins for small C."""
+        costs O(L·C·dk), so there the chunkwise path only wins for small C.
+
+        NUMERICS: "the exact same recurrence" is exact in ALGEBRA, not in
+        floating point. The chunkwise and recurrent cores reassociate the same
+        sums differently, so a chunk-aligned call reproduces `__call__` bit for
+        bit while a token-by-token call does not. Measured end to end on the
+        9-layer demo model, decode vs the training forward:
+
+            fp32   prefill 0        per-token 2.8e-6   (argmax 64/64, 64/64)
+            bf16   prefill 0        per-token ~1e-1    (argmax 64/64, 62/64)
+
+        Both cores run their internals in fp32 (core.py's D_TYPE) — the bf16 gap
+        is one ULP entering through the projections and then compounding across
+        the delta-rule recurrence and the depth stack. It is inherent to running
+        two different algorithms, not a bug, and it is why the per-token figure
+        cannot be driven to zero the way the prefill one was. Note the argmax
+        numbers come from a RANDOMLY INITIALIZED model, whose near-uniform logits
+        are the worst case for tie-breaking; trained logits are far more peaked.
+        If you need decode to match training bit for bit under bf16, feed
+        chunk-aligned blocks (prefill-style) rather than single tokens."""
         q, k, v, g, b, w, new_conv = self._project(
             x, conv_states=(cache.q_conv, cache.k_conv, cache.v_conv)
         )

@@ -248,13 +248,29 @@ class GroupedQueryLatentAttention(nnx.Module):
     #  new positions are written into it.  Use it for prefill (L = prompt length)
     #  and per-token decode (L = 1) alike.
     # ----------------------------------------------------------------------- #
-    def init_cache(self, batch_size: int, max_len: int, dtype=F32) -> MLACache:
+    def init_cache(
+        self, batch_size: int, max_len: int, dtype=None
+    ) -> MLACache:
         """Initialize the streaming KV cache for a given batch size and max length.
-        The cache is a preallocated buffer of shape [B, max_len, Hkv*Dh] and a position counter.
-        The buffer is filled with zeros initially."""
+        The cache is a preallocated buffer of shape [B, max_len, Hkv*Dh] and a
+        position counter. The buffer is filled with zeros initially.
+
+        The buffer dtype DEFAULTS TO THE LAYER'S compute_dtype, and that default
+        matters — do not override it with fp32 out of caution. The cache holds
+        w_dkv outputs, which are produced in compute_dtype; a wider buffer
+        silently promotes everything downstream of it, because `step` reads the
+        latent back out of the cache and JAX propagates the wider type through
+        the QK einsum, the attention weights, and the AV matmul. Decode would
+        then run its whole attention core in fp32 while training runs it in bf16
+        — the two paths stop agreeing (measured: 2.9e-3 relative on one layer,
+        ~8e-2 through a 9-layer stack), and the fp32 buffer also doubles the KV
+        cache, which is the one thing MLA exists to shrink.
+
+        Passing an explicit dtype is still supported for deliberate choices (e.g.
+        an fp32 cache with fp32 compute), but it must be a choice."""
         d_kv = self.num_kv_heads * self.head_dim
         return MLACache(
-            l_kv=jnp.zeros((batch_size, max_len, d_kv), dtype),
+            l_kv=jnp.zeros((batch_size, max_len, d_kv), dtype or self.compute_dtype),
             pos=jnp.array(0, jnp.int32),
         )
 
@@ -282,9 +298,12 @@ class GroupedQueryLatentAttention(nnx.Module):
         ).swapaxes(1, 2)  # (B, Hkv, max_len, Dh)
         l_kv_rep = l_kv_heads.repeat(self.group_size, axis=1)  # (B, Hq, max_len, Dh)
 
-        # Scores: the L new queries attend over all max_len cached slots. Upcast to
-        # fp32 for the masking/softmax, mirroring __call__ — otherwise the decode-time
-        # attention distribution would run in bf16 while training's runs in fp32.
+        # Scores: the L new queries attend over all max_len cached slots. The
+        # einsum runs in compute_dtype and only its RESULT is upcast for the
+        # masking/softmax — exactly as in __call__, which is what makes the two
+        # paths agree bit for bit. That parity depends on the cache being
+        # compute_dtype (see init_cache): an fp32 buffer would promote this
+        # einsum's operands and silently move the whole core to fp32.
         logits = jnp.einsum("bhqd, bhkd -> bhqk", q_heads, l_kv_rep).astype(
             F32
         ) / jnp.sqrt(self.head_dim)

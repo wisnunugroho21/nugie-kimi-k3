@@ -361,8 +361,13 @@ class DecoderLayer(nnx.Module):
 
         return blocks, partial_block, aux
 
-    def init_cache(self, batch_size: int, max_len: int, dtype=jnp.float32):
-        """Per-layer streaming cache: a GDN2Cache (linear layer) or MLACache (MLA)."""
+    def init_cache(self, batch_size: int, max_len: int, dtype=None):
+        """Per-layer streaming cache: a GDN2Cache (linear layer) or MLACache (MLA).
+
+        `dtype=None` lets each token mixer pick its own — which is what keeps
+        decode numerically identical to training under bf16. Both mixers default
+        their buffers to compute_dtype and keep the parts that must stay fp32
+        (GDN-2's recurrent state) fp32 regardless."""
         return self.token_mixer.init_cache(batch_size, max_len, dtype)
 
     def step(
@@ -505,10 +510,18 @@ class KimiK3(nnx.Module):
     #  of re-reading history.  AttnRes adds no cache — see its module docstring.
     # ----------------------------------------------------------------------- #
     def init_cache(
-        self, batch_size: int, max_len: int | None = None, dtype=jnp.float32
+        self, batch_size: int, max_len: int | None = None, dtype=None
     ) -> list:
         """Streaming caches for every layer. `max_len` (default cfg.max_seq_len)
-        sizes the MLA latent buffers; GDN-2 layers ignore it (fixed-size state)."""
+        sizes the MLA latent buffers; GDN-2 layers ignore it (fixed-size state).
+
+        `dtype` defaults to None, meaning EACH LAYER PICKS ITS OWN — the MLA
+        latent buffer and the GDN-2 short-conv buffers take compute_dtype, while
+        the GDN-2 recurrent state stays fp32 regardless. Do not pass fp32 here to
+        "be safe" under bf16: both mixers read their caches back into the forward
+        path, so a wider buffer promotes the arithmetic downstream of it and
+        decode silently stops matching training (see
+        GroupedQueryLatentAttention.init_cache for the full account)."""
         max_len = max_len or self.cfg.max_seq_len
         return [layer.init_cache(batch_size, max_len, dtype) for layer in self.layers]
 
