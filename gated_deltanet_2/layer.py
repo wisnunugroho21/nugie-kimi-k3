@@ -4,14 +4,6 @@ Gated DeltaNet-2 token-mixer layer in Flax NNX, ANNOTATED against the paper
 parameterization), with supporting equations 11, 12, 85, 86 and the numerical
 notes in Appendix D.
 
-ROLE IN THIS PROJECT (a Kimi K3 recreation): this layer is the deliberate
-STAND-IN for K3's Kimi Delta Attention (KDA) — the linear-attention token mixer
-on 3 of every 4 layers. KDA and GDN-2 are siblings in the gated-delta-rule
-family with fine-grained channel-wise gating; GDN-2 decouples KDA/GDN's single
-beta into a separate erase gate `b` and write gate `w`. Where this layer's
-parameterization follows Kimi Linear rather than the GDN-2 paper (the sigmoid
-low-rank output gate below), the docstrings say so explicitly.
-
 Block design (Fig. 1 right; Sec. 3.5 "Gated DeltaNet-2 token mixer"):
   q,k = L2norm(SiLU(ShortConv(Linear(x))))      # key-side paths + L2 norm (Sec. 3.5, App. D.2)
   v   =        SiLU(ShortConv(Linear(x)))        # value path (Sec. 3.5; Fig. 1 caption)
@@ -19,8 +11,7 @@ Block design (Fig. 1 right; Sec. 3.5 "Gated DeltaNet-2 token mixer"):
   b   = sigmoid(Linear_b(x))                     # erase gate (Eq. 11 / 85); x2 if neg-eigenvalue
   w   = sigmoid(Linear_w(x))                     # write gate (Eq. 11 / 85)
   O   = chunkwise_gated_delta_rule_2(q,k,v,g,b,w, state)   # Gated Delta Rule-2 (Eq. 10)
-  out = Linear_o( RMSNorm(O) * σ(W↑ W↓ x) )        # gated RMSNorm + out proj — sigmoid
-        # low-rank gate, Kimi Linear's variant of the paper's SiLU gate (see GatedRMSNorm)
+  out = Linear_o( RMSNorm(O) * SiLU(Linear_g(x)) )  # gated RMSNorm + out proj (Sec. 3.5, App. D.5)
 
 Grouped value heads (Sec. 3.5 last sentence / App. C.1): with num_v_heads = G*num_heads,
 the key-side tensors q, k, the log-decay g, and b are shared across the G value heads
@@ -92,11 +83,7 @@ class RMSNorm(nnx.Module):
     """Plain RMSNorm used for the pre-norms around mixer / channel-mixer.
     Takes no rngs: its only parameter is the deterministic all-ones gain."""
 
-    def __init__(self, dim: int, *, eps: float = 1e-5, rngs: nnx.Rngs | None = None):
-        # `rngs` is accepted (and ignored) only for call-site parity with the other
-        # nnx modules — RMSNorm's single parameter is the deterministic all-ones gain,
-        # so it needs no PRNG. Letting callers pass rngs uniformly keeps DecoderLayer's
-        # construction of norms identical to its construction of the projection layers.
+    def __init__(self, dim: int, *, eps: float = 1e-5):
         self.eps = eps
         self.weight = nnx.Param(jnp.ones((dim,)))
 
@@ -108,6 +95,7 @@ class RMSNorm(nnx.Module):
         # Scale by the fp32 weight BEFORE the downcast — casting first would
         # promote the result right back to fp32 and waste the cast.
         return (xf * rms * self.weight[...]).astype(x.dtype)
+
 
 class LowRankLinear(nnx.Module):
     """y = W_up(W_down x). The W↑(W↓·) factorization Kimi Linear uses for its
@@ -133,6 +121,7 @@ class LowRankLinear(nnx.Module):
         x = self.down(x)
         return self.up(x)
 
+
 class GatedRMSNorm(nnx.Module):
     """Head-wise RMSNorm of the recurrent output, gated by a LOW-RANK SIGMOID gate.
 
@@ -140,8 +129,7 @@ class GatedRMSNorm(nnx.Module):
 
         Sigmoid(W↑g W↓g x) ⊙ RMSNorm(O)
 
-    Two deliberate deviations from the GDN-2 paper's block, both adopted from
-    Kimi Linear (and kept by K3's KDA):
+    Two corrections vs the GDN-2 paper block used in your gdn2_layer:
       (1) sigmoid, not SiLU/swish  — Kimi Linear's ablation found the swish output
           gate (GDN's choice) performs substantially worse than sigmoid, and they
           adopt sigmoid across all experiments including their GDN hybrid baseline.
@@ -162,7 +150,7 @@ class GatedRMSNorm(nnx.Module):
         eps: float = 1e-5,
         rngs: nnx.Rngs,
     ):
-        self.norm = RMSNorm(head_dim, eps=eps, rngs=rngs)
+        self.norm = RMSNorm(head_dim, eps=eps)
         self.gate = LowRankLinear(
             d_model, gate_rank, inner_dim, use_bias=False, rngs=rngs
         )
@@ -261,7 +249,7 @@ class GatedDeltaNet2(nnx.Module):
         conv_size: int = 4,
         expanded_erase: bool = False,  # erase gate in [0,2] (neg-eigenvalue variant; Sec. 3.1, App. C.1)
         compute_dtype: jnp.dtype = jnp.float32,
-        core: str = "centered",  # core.py chunkwise core; "subchunking"/"pairwise"
+        core: str = "centered",  # rule.py chunkwise core; "subchunking"/"pairwise"
         #   have no decay-range limit if the learned decay outgrows the centered
         #   core's per-chunk |G_C| ~ 176 (see chunkwise_gated_delta_rule_2)
         sub_chunk_size: int = 16,  # c for core="subchunking"; ignored otherwise
@@ -269,7 +257,7 @@ class GatedDeltaNet2(nnx.Module):
         rngs: nnx.Rngs,
     ):
         # Matmul dtype for the q/k/v/b/w/o projection Linears (bf16 on H200). The
-        # chunkwise/recurrent core (core.py) upcasts to fp32 regardless, and the
+        # chunkwise/recurrent core (rule.py) upcasts to fp32 regardless, and the
         # log-decay branch (f_proj) is kept fp32 below — both for numerical safety
         # (App. D.1 / D.3).
         self.compute_dtype = compute_dtype
@@ -512,7 +500,7 @@ class GatedDeltaNet2(nnx.Module):
         o = o.swapaxes(1, 2).reshape(B, L, self.Hv, self.dv)  # ungroup value heads
         o = self.o_norm(o, x).astype(
             x.dtype
-        )  # low-rank SIGMOID output gate computed inside, from x (see GatedRMSNorm)
+        )  # SiLU output gate computed inside, from x (Sec. 3.5 / App. D.5)
 
         return self.o_proj(o)  # project back to d_model
 

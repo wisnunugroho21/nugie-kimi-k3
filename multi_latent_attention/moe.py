@@ -1,17 +1,10 @@
 """
-Full-width dispatched grouped-GEMM MoE (JAX / Flax NNX).
+Dispatched grouped-GEMM MoE channel mixer for Kimi Linear (JAX / Flax NNX).
 
-ROLE IN THIS PROJECT (a Kimi K3 recreation): the model itself uses the LatentMoE
-subclass (latent_moe.py) as its channel mixer — K3 runs its routed experts in a
-shared low-rank latent. This class remains as (a) the BASE CLASS providing the
-routing (`_route`) and shared-expert (`_shared`) machinery LatentMoE inherits
-verbatim, and (b) the full-width reference MoE (DeepSeek-V3 / Moonlight / Kimi
-K2 style) it is measured against.
-
-The production dispatch pattern, shared by both: permute tokens so each expert's
-assignments are contiguous (dispatch), run one matmul per expert as a single
-grouped GEMM (`jax.lax.ragged_dot`), then un-permute and weighted-sum (combine).
-No token dropping, no capacity padding.
+Replaces the dense O(E) reference MoE in kimi_linear_gdn2.py with the production
+pattern: permute tokens so each expert's assignments are contiguous (dispatch),
+run one matmul per expert as a single grouped GEMM (`jax.lax.ragged_dot`), then
+un-permute and weighted-sum (combine). No token dropping, no capacity padding.
 
 Pipeline per forward:
     1. Route:    sigmoid affinities (+ aux-loss-free bias on the SELECTION only)
@@ -178,15 +171,6 @@ class GroupedGemmMoE(nnx.Module):
 
         return top_idx, gate, logits
 
-    @staticmethod
-    def _norm_sigmoid_probs(router_logits: jax.Array) -> jax.Array:
-        """Mean normalized sigmoid affinity per expert, P_e = mean_t s'_{e,t} with
-        s'_{e,t} = sigmoid(logit_{e,t}) / Σ_e' sigmoid(logit_{e',t}) — the P_e of
-        DeepSeek-V3's sequence-level balancing loss (its Eq. 18), consistent with
-        the sigmoid scoring `_route` selects and gates with. [T, E] -> [E]."""
-        scores = jax.nn.sigmoid(router_logits)
-        return (scores / (scores.sum(-1, keepdims=True) + 1e-9)).mean(0)
-
     def _shared(self, x_flat: jax.Array) -> jax.Array:
         """Shared expert(s) as a single wider SwiGLU (always applied to every token).
         Runs the matmuls in compute_dtype (bf16 on H200); the caller upcasts the
@@ -239,15 +223,11 @@ class GroupedGemmMoE(nnx.Module):
         load = group_sizes.astype(F32) / (T * k)  # fraction per expert
 
         # ---- aux loss ----
-        # DeepSeek-V3-style sequence-level balancing loss: E * <f_e, P_e>, where
-        # f_e is the realized per-expert load fraction (non-differentiable; acts
-        # as a constant) and P_e the mean NORMALIZED SIGMOID affinity
-        # s'_e = sigmoid(logit_e) / Σ_e' sigmoid(logit_e') — the same scoring the
-        # router actually selects with (V3 Eq. 17-20), not a softmax, so the aux
-        # gradient pushes on the exact quantity routing consumes. Reuses the
-        # logits already computed by _route (no second router matmul; the extra
-        # sigmoid is elementwise).
-        probs = self._norm_sigmoid_probs(router_logits)  # [E]
+        # Switch/DeepSeek-style aux loss: E * <f_e, P_e>, where f_e is the realized
+        # per-expert load fraction (non-differentiable; acts as a constant) and P_e
+        # the mean softmax routing probability (this is where the gradient flows).
+        # Reuses the logits already computed by _route (no second router matmul).
+        probs = jax.nn.softmax(router_logits, axis=-1).mean(0)  # [E]
         aux_loss = self.aux_alpha * self.E * jnp.sum(load * probs)
         aux = {"load": load, "aux_loss": aux_loss, "group_sizes": group_sizes}
         return out, aux

@@ -1,31 +1,17 @@
-"""Gated NoPE Multi-head Latent Attention (MLA) — the FULL-attention token mixer
-of our Kimi K3 recreation.
+"""NoPE Multi-head Latent Attention (MLA) — the FULL-attention token mixer.
 
-In the K3 hybrid (inherited from Kimi Linear), 1 of every 4 layers is ordinary
-softmax attention; this module is that layer:
+In the Kimi Linear hybrid (Sec. 3 of the paper), 1 of every 4 layers is ordinary
+softmax attention; this module is that layer, in Kimi Linear's exact flavor:
 
   * MLA (DeepSeek-V2 lineage): keys/values live in a small shared low-rank LATENT,
     so the decode-time cache stores one latent vector per position instead of full
     K and V — the whole point of MLA is that tiny KV cache.
-  * NoPE — NO positional encoding of any kind. The linear-attention layers (KDA
-    in K3; GDN-2 here) already encode position implicitly through their
-    recurrence, so the hybrid drops RoPE from its full-attention layers entirely
-    (Kimi Linear Sec. 3.3, "NoPE"; K3 keeps the recipe).
+  * NoPE — NO positional encoding of any kind. The GDN-2 linear layers already
+    encode position implicitly through their recurrence, so Kimi Linear drops RoPE
+    from its full-attention layers entirely (paper Sec. 3.3, "NoPE").
   * Written in the ABSORBED form (see the class docstring): with no RoPE in the
     way, the K/V up-projections fold into the neighboring matrices exactly, so the
     latent itself serves as both K and V and never gets up-projected at runtime.
-  * GATED MLA (Kimi K3: "Gated MLA improves attention selectivity"): a head-wise
-    sigmoid output gate applied to the attention output right before the final
-    (absorbed) output projection,
-
-        o_gated = sigmoid(W_g x) ⊙ o
-
-    This is the selectivity gate of the "Gated Attention" lineage
-    (arXiv:2505.06708 — the input-conditioned, head-specific elementwise output
-    gate Kimi K2 adopted, which suppresses attention sinks and massive
-    activations). K3's exact gate formulation awaits its technical report; this
-    is the lineage-faithful reading of the blog's description. Behind the
-    `gated` flag (the model config enables it by default via mla_gated).
 
 Two paths, same math: `__call__` for full-sequence training (causal-masked matrix
 attention) and `step` for streaming decode (append the new latent to a preallocated
@@ -86,7 +72,6 @@ class GroupedQueryLatentAttention(nnx.Module):
         head_dim: int,
         rngs: nnx.Rngs,
         compute_dtype: jnp.dtype = F32,
-        gated: bool = False,
     ):
         # Matmul dtype for the projections (bf16 on H200); the QK^T / softmax / AV
         # core is upcast to fp32 below regardless, for a stable attention distribution.
@@ -140,33 +125,6 @@ class GroupedQueryLatentAttention(nnx.Module):
             param_dtype=F32,
             rngs=rngs,
         )
-
-        # Gated MLA (Kimi K3): sigmoid output gate — sigmoid(W_g x) ⊙ o —
-        # applied to the per-head attention output BEFORE w_uv_o (the G1
-        # "before out-projection" position of the Gated Attention paper,
-        # head-specific and elementwise over the d_q gate width). With the
-        # Xavier gain-2^{-2.5} init the gate starts near sigmoid(0) = 0.5: a
-        # uniform half-open gate, so the init-time behavior is a benignly
-        # rescaled ungated MLA.
-        self.gated = gated
-        if gated:
-            self.w_gate = nnx.Linear(
-                embed_dim,
-                d_q,
-                use_bias=False,
-                kernel_init=_XAVIER,
-                dtype=compute_dtype,
-                param_dtype=F32,
-                rngs=rngs,
-            )
-
-    def _output_gate(self, o: jax.Array, x: jax.Array) -> jax.Array:
-        """sigmoid(W_g x) ⊙ o. o: [B, L, Hq*Dh] attention output, x: [B, L,
-        embed_dim] block input. The sigmoid is taken in fp32 so training and
-        decode resolve it identically, then returns to o's dtype for the
-        (possibly bf16) w_uv_o matmul."""
-        g = jax.nn.sigmoid(self.w_gate(x).astype(F32))
-        return (g * o.astype(F32)).astype(o.dtype)
 
     def __call__(self, x: jax.Array) -> jax.Array:
         # x: (B, T, embed_dim)
@@ -235,10 +193,6 @@ class GroupedQueryLatentAttention(nnx.Module):
             batch_size, seq_length, self.num_q_heads * self.head_dim
         )
 
-        # Gated MLA (K3): sigmoid output gate before the absorbed out-projection.
-        if self.gated:
-            weighted_latents = self._output_gate(weighted_latents, x)
-
         # Absorbed W_UV . W_O: up-project the value latent and output-project.
         output = self.w_uv_o(weighted_latents)  # (B, T, embed_dim)
 
@@ -250,13 +204,13 @@ class GroupedQueryLatentAttention(nnx.Module):
     #  new positions are written into it.  Use it for prefill (L = prompt length)
     #  and per-token decode (L = 1) alike.
     # ----------------------------------------------------------------------- #
-    def init_cache(self, batch_size: int, max_len: int, dtype=None) -> MLACache:
+    def init_cache(self, batch_size: int, max_len: int, dtype=F32) -> MLACache:
         """Initialize the streaming KV cache for a given batch size and max length.
-        The cache is a zero-filled preallocated buffer of shape [B, max_len, Hkv*Dh]
-        plus a position counter. dtype defaults to fp32 (None => fp32)."""
+        The cache is a preallocated buffer of shape [B, max_len, Hkv*Dh] and a position counter.
+        The buffer is filled with zeros initially."""
         d_kv = self.num_kv_heads * self.head_dim
         return MLACache(
-            l_kv=jnp.zeros((batch_size, max_len, d_kv), dtype or F32),
+            l_kv=jnp.zeros((batch_size, max_len, d_kv), dtype),
             pos=jnp.array(0, jnp.int32),
         )
 
@@ -285,9 +239,8 @@ class GroupedQueryLatentAttention(nnx.Module):
         l_kv_rep = l_kv_heads.repeat(self.group_size, axis=1)  # (B, Hq, max_len, Dh)
 
         # Scores: the L new queries attend over all max_len cached slots. Upcast to
-        # fp32 for the mask/softmax exactly as the training __call__ path does — the
-        # projections may run in bf16, but the attention distribution must be built
-        # in fp32 so prefill/decode stay numerically consistent with training.
+        # fp32 for the masking/softmax, mirroring __call__ — otherwise the decode-time
+        # attention distribution would run in bf16 while training's runs in fp32.
         logits = jnp.einsum("bhqd, bhkd -> bhqk", q_heads, l_kv_rep).astype(
             F32
         ) / jnp.sqrt(self.head_dim)
@@ -300,8 +253,8 @@ class GroupedQueryLatentAttention(nnx.Module):
         mask = k_pos[None, :] <= q_pos[:, None]  # (L, max_len)
         logits = jnp.where(mask[None, None], logits, -jnp.inf)
 
-        # Softmax over the key axis -> per-query attention distribution (fp32), then
-        # back to the compute dtype for the (bf16) weighted-sum matmul below.
+        # Softmax over the key axis (fp32) -> back to the compute dtype for the
+        # weighted-sum matmul, exactly as in __call__.
         a = jax.nn.softmax(logits, axis=-1).astype(l_kv_rep.dtype)
 
         # Weighted sum of value-latents: the same latent serves as both K and V.
@@ -309,12 +262,6 @@ class GroupedQueryLatentAttention(nnx.Module):
         weighted = weighted.swapaxes(1, 2).reshape(
             B, L, self.num_q_heads * self.head_dim
         )
-
-        # Gated MLA (K3): same sigmoid gate as the training path. The gate
-        # depends only on the CURRENT positions' x — never on past positions —
-        # so streaming needs no extra cache and prefill/decode match training.
-        if self.gated:
-            weighted = self._output_gate(weighted, x)
 
         output = self.w_uv_o(weighted)  # (B, L, embed_dim)
         return output, MLACache(l_kv, new_pos)
