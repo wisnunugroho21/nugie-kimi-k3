@@ -117,9 +117,28 @@ class KimiK3Config:
     full_attn_period: int = 4
 
     # --- Attention Residuals (§2.2) ---
-    # Decoder layers per AttnRes block. The paper partitions its 93 layers into
-    # 12-layer blocks (~8 blocks, +1 source for the embedding). This is a
-    # SEPARATE, coarser partition than the 4-layer hybrid block above.
+    # DECODER LAYERS per AttnRes block — a SEPARATE, coarser partition than the
+    # 4-layer hybrid block above (K3: 12 layers = 3 hybrid blocks).
+    #
+    # The real design rule is the block COUNT, not this size: the AttnRes paper
+    # (arXiv:2603.15031 §5.3) sweeps block size and finds a broad plateau, then
+    # fixes "the number of blocks to ≈8 for infrastructure efficiency" — N is
+    # what sets cross-stage communication under pipeline parallelism. K3 obeys
+    # that at 93 layers / 12 = 8 blocks (the last partial), 9 sources with the
+    # embedding. So when scaling this config up, pick attnres_block_size ≈
+    # n_layers / 8 rather than holding it fixed.
+    #
+    # CAUTION when reading the AttnRes paper directly: it counts MODULES, not
+    # decoder layers ("27 Transformer blocks (54 layers)"; its pseudocode notes
+    # "block_size counts ATTN + MLP"). This field follows K3's convention, so a
+    # value copied straight out of that paper's sweep would be 2× too small.
+    #
+    # Two extreme settings are useful for testing. block_size = n_layers gives
+    # N = 1: every read is then a 2-way softmax between the embedding and one
+    # accumulated stream — the paper's "standard residual connections with the
+    # embedding isolated as b_0". block_size = 1 is the finest granularity this
+    # implementation offers, one source per decoder layer; it is NOT quite Full
+    # AttnRes, since a layer's two module outputs still get summed together.
     attnres_block_size: int = 3
 
     # --- GDN-2 token mixer (the KDA replacement) — gated_deltanet_2/layer.py ---
