@@ -22,7 +22,7 @@ import kimi_k3 as k3
 from kimi_k3.kda import KimiDeltaAttention, kda_chunkwise, kda_recurrent
 from kimi_k3.mla import GatedMLA
 from kimi_k3.moe import StableLatentMoE, quantile_balancing_update, quantile_balancing_update_histogram
-from kimi_k3.muon import orthogonalize
+from kimi_k3.muon import orthogonalize, per_head_muon
 
 
 @pytest.fixture(scope="module")
@@ -337,6 +337,47 @@ def test_optimizer_step_runs(cfg):
         updates, state = tx.update(jax.grad(loss)(params), state, params)
         params = optax.apply_updates(params, updates)
     assert float(loss(params)) < float(before)
+
+
+def test_muon_returns_gradient_direction_updates():
+    """`per_head_muon` must point ALONG the gradient, like `scale_by_adam`.
+
+    The descent negation belongs to `scale_by_learning_rate` (flip_sign=True).
+    If this transformation negated as well, the two would cancel and every
+    matrix parameter would ascend. Asserting the raw direction here is what
+    pins the convention down; a loss-goes-down test does not, because the
+    AdamW branch alone is enough to drag the loss down for a few steps.
+    """
+    grads = {"w": jax.random.normal(jax.random.PRNGKey(0), (16, 8))}
+    tx = per_head_muon(momentum=0.0, nesterov=False)
+    update, _ = tx.update(grads, tx.init(grads), grads)
+    # <UV^T, USV^T> = tr(S) > 0, so this is strictly positive whenever correct.
+    assert float(jnp.vdot(update["w"], grads["w"])) > 0
+
+
+def test_optimizer_chain_descends_on_a_convex_problem():
+    """End-to-end sign check on loss = 0.5*||W||^2, whose minimum is at W = 0.
+
+    The regression this guards against inverted the whole Muon branch: the same
+    setup went 6.21 -> 7.19 (ascent) before the fix and 6.21 -> 5.20 after, so
+    the direction assertion and a plain "the norm shrank" both separate them
+    decisively.
+    """
+    import optax
+
+    params = {"w": jnp.eye(4) * 3.0 + 0.1}
+    loss = lambda p: 0.5 * jnp.sum(p["w"] ** 2)
+    start = float(jnp.linalg.norm(params["w"]))
+    tx = k3.kimi_k3_optimizer(0.1, num_heads=4, params=params, weight_decay=0.0)
+    state = tx.init(params)
+
+    first, _ = tx.update(jax.grad(loss)(params), state, params)
+    assert float(jnp.vdot(first["w"], jax.grad(loss)(params)["w"])) < 0, "update must oppose the gradient"
+
+    for _ in range(15):
+        updates, state = tx.update(jax.grad(loss)(params), state, params)
+        params = optax.apply_updates(params, updates)
+    assert float(jnp.linalg.norm(params["w"])) < 0.95 * start
 
 
 # ----------------------------------------------------------------- Table 1

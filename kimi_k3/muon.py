@@ -101,6 +101,19 @@ def per_head_muon(
     single learning rate could not serve differently-shaped parameters; the
     factor puts Muon's update RMS on the same footing as AdamW's, which is what
     lets one LR schedule cover the whole model.
+
+    SIGN CONVENTION — the thing to get right when chaining this.  Like
+    `optax.scale_by_adam`, this transformation returns an update pointing ALONG
+    the gradient, not against it. It is not a descent step on its own: the
+    descent comes from `optax.scale_by_learning_rate`, which negates
+    (`flip_sign=True` by default). So the chain must be
+
+        per_head_muon() -> add_decayed_weights(wd) -> scale_by_learning_rate(lr)
+
+    exactly as in the standard AdamW chain, and for the same reason:
+    `add_decayed_weights` also assumes a gradient-direction update, so that the
+    final negation turns both terms into descent at once. Negating here as well
+    would cancel that negation and turn training into gradient ASCENT.
     """
 
     def init_fn(params):
@@ -114,9 +127,10 @@ def per_head_muon(
 
         def step(u, h):
             if u.ndim != 2:  # 1-D parameters are not Muon's business
-                return u
+                return u  # passed through in gradient direction, as below
             o = orthogonalize(u.astype(F32), int(h))
-            return -0.2 * (max(u.shape) ** 0.5) * o
+            # Gradient direction, NOT descent — see "SIGN CONVENTION" above.
+            return 0.2 * (max(u.shape) ** 0.5) * o
 
         updates = jax.tree.map(step, raw, heads)
         return updates, MuonState(buf)
