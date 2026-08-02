@@ -59,6 +59,8 @@ Pipeline per forward:
     6. Up:       y = shared(x) + W↑ RMSNorm(u).
 """
 
+from typing import NamedTuple
+
 import flax.nnx as nnx
 import jax
 import jax.numpy as jnp
@@ -226,28 +228,53 @@ class DenseFFN(nnx.Module):
 # --------------------------------------------------------------------------- #
 #  The ROUTED branch of Eq. 11:  W↑ RMSNorm( Σ_{i ∈ T_k(x)} p_i E_i^routed(W↓x) )
 # --------------------------------------------------------------------------- #
-class RoutedExperts(nnx.Module):
-    """The sparse, LATENT-WIDTH half of Stable LatentMoE (Eq. 11, second term).
+#  Routing (§2.3.3, Eq. 13) — the assignment, kept apart from the experts.
+# --------------------------------------------------------------------------- #
+class Routing(NamedTuple):
+    """One batch's routing decision — the complete output of Eq. 13.
 
-    Owns everything that makes routing work — the router and its balancing bias
-    (Eq. 13), the latent bottleneck W↓/W↑, the stacked expert bank, the
-    dispatch/grouped-GEMM/combine machinery, and the §2.3.1 RMSNorm — because
-    these are one interlocking mechanism: the router's top-k decides which rows
-    of the expert bank a token visits, and the normalization exists precisely to
-    absorb the scale variation that *that choice* introduces.
+    Named rather than a bare tuple because three of these five fields exist for
+    reasons that are easy to mix up:
 
-    THE LATENT IS THE POINT. In a conventional MoE each selected expert receives
-    the full d-dimensional token, so communication and expert-weight traffic grow
-    with how many experts a token activates — and K3 wants 16 of them. Here the
-    token is down-projected ONCE to width ℓ (K3: 0.5·d) and only that ℓ-vector is
-    dispatched, so raising top_k no longer raises the per-token traffic
-    proportionally in d. Shared experts (see `SharedExperts`) keep the full-width
-    path, so nothing is lost overall — the two branches divide the work.
+      top_idx  [T, k]  T_i: which experts each token was assigned to.
+      gate     [T, k]  p_{i,j}: the mixture weights for those experts. Derived
+                       from the TRUE affinities, never from the biased ones.
+      logits   [T, E]  the raw router output, kept only so the optional
+                       Switch-style aux loss can reuse it without a second matmul.
+      scores   [T, E]  s = Sigmoid(logits), the true affinities over all experts.
+                       Quantile Balancing needs the full row, not just the top-k.
+      cutoff   [T]     α_i: the (k+1)-th BIASED score — the bar an expert had to
+                       clear to enter this token's top-k. Only QB uses it.
+    """
+
+    top_idx: jax.Array
+    gate: jax.Array
+    logits: jax.Array
+    scores: jax.Array
+    cutoff: jax.Array
+
+
+class Router(nnx.Module):
+    """K3 Eq. 13 — who goes where, and nothing else.
+
+    Deliberately separate from `RoutedExperts`: this class decides the
+    ASSIGNMENT (which experts a token visits and with what weight), while the
+    expert bank decides WHAT HAPPENS once it gets there. They are coupled only
+    through a `Routing`, which makes both halves testable on their own and makes
+    the load-balancing machinery — which is entirely a routing concern — sit
+    where it belongs.
+
+    Everything about balancing lives here too:
+      * the selection bias b (Eq. 13), an nnx.Variable rather than an nnx.Param
+        because it is never differentiated;
+      * `balance()`, the Quantile Balancing update that produces the NEXT bias
+        (Eq. 14);
+      * `aux_loss()`, the auxiliary loss K3 does NOT use, kept for comparison.
 
     Args:
-        d_model:     model width d (what the router scores, and what W↓/W↑ bridge).
-        latent_dim:  routed-expert width ℓ. ℓ = d recovers a conventional MoE.
-        d_ff:        per-expert hidden width (SiTU-GLU inner dim), in latent space.
+        d_model:     model width. The router scores the FULL-WIDTH token, not the
+                     latent — routing is a decision about the token, and the
+                     down-projection into the expert latent is lossy.
         n_routed:    number of experts E (K3: 896).
         top_k:       experts activated per token (K3: 16).
         n_groups / topk_groups: optional group-limited ("node-limited") routing
@@ -255,7 +282,9 @@ class RoutedExperts(nnx.Module):
                      Balancing is its answer to routing at this scale — so this
                      defaults to OFF (n_groups=1). Kept because at real scale the
                      groups map to devices and it bounds all-to-all fan-out.
-        beta1/beta2: SiTU-GLU soft caps (K3: 4 and 25).
+        norm_topk:   renormalize the k gate weights to sum to 1.
+        routed_scale: extra scale on the normalized weights (DeepSeek's
+                     routed_scaling_factor).
         bias_balancing: enable the auxiliary-loss-free selection bias.
         aux_alpha:   coefficient of the optional Switch-style aux loss. K3 is
                      auxiliary-loss-FREE, so this defaults to 0.0.
@@ -264,8 +293,6 @@ class RoutedExperts(nnx.Module):
     def __init__(
         self,
         d_model: int,
-        d_ff: int,
-        latent_dim: int | None = None,
         n_routed: int = 896,
         top_k: int = 16,
         *,
@@ -273,12 +300,8 @@ class RoutedExperts(nnx.Module):
         topk_groups: int = 1,
         norm_topk: bool = True,
         routed_scale: float = 1.0,
-        beta1: float = 4.0,
-        beta2: float = 25.0,
         bias_balancing: bool = True,
         aux_alpha: float = 0.0,
-        rms_eps: float = 1e-5,
-        compute_dtype: jnp.dtype = jnp.float32,
         rngs: nnx.Rngs,
     ):
         assert n_routed % n_groups == 0, "n_routed must be divisible by n_groups"
@@ -290,32 +313,150 @@ class RoutedExperts(nnx.Module):
             "top_k + 1 experts must fit inside the topk_groups selected groups "
             "(the +1 is the Quantile Balancing cutoff, Eq. 14)"
         )
-        self.d_model = d_model
-        self.latent = latent_dim if latent_dim is not None else d_model
-        self.d_ff = d_ff
         self.E = n_routed
         self.top_k = top_k
         self.n_groups = n_groups
         self.topk_groups = topk_groups
         self.norm_topk = norm_topk
         self.routed_scale = routed_scale
-        self.beta1, self.beta2 = beta1, beta2
         self.bias_balancing = bias_balancing
         self.aux_alpha = aux_alpha
-        # Matmul dtype for the expert grouped GEMMs (bf16 on H200). Weights are
-        # stored fp32; the router, the combine (scatter-add), the RMSNorm and the
-        # QB statistics stay fp32 for stable routing/balancing.
-        self.compute_dtype = compute_dtype
 
-        # --- Router (Eq. 13). Scores the FULL-WIDTH x, not the latent z: routing
-        # is a decision about the token, and the down-projection is lossy. ---
-        self.router = nnx.Linear(
+        # Scoring stays in fp32 (no compute_dtype): the top-k boundary and the
+        # balancing quantiles are decisions, and a bf16 tie is a different route.
+        self.linear = nnx.Linear(
             d_model, n_routed, use_bias=False, kernel_init=_XAVIER, rngs=rngs
         )
         # Selection bias b (Eq. 13/14). An nnx.Variable, not an nnx.Param: it is
         # never differentiated — the training loop overwrites it each step from
         # the QB update, and it is frozen at inference.
-        self.router_bias = nnx.Variable(jnp.zeros((n_routed,), F32))
+        self.bias = nnx.Variable(jnp.zeros((n_routed,), F32))
+
+    def __call__(self, x_flat: jax.Array) -> Routing:
+        """x_flat: [T, d_model] -> Routing (Eq. 13).
+
+        Auxiliary-loss-free routing: the balancing bias is added ONLY to the
+        SELECTION score and under stop_gradient, so it decides WHICH experts a
+        token goes to but never appears in p_{i,j} nor in the router's gradient
+        (Eq. 13: "Because b is omitted from p_{i,j}, it regulates dispatch
+        without altering the mixture weights or the gradient-based optimization
+        of the router").
+
+        Selection runs Top-(k+1) rather than Top-k. The extra entry is the
+        per-token cutoff α_i, and taking it from the routing pass itself is what
+        lets Quantile Balancing derive the next bias from a single forward with
+        no separate token-side quantile (§2.3.3).
+        """
+        logits = self.linear(x_flat).astype(F32)
+        scores = jax.nn.sigmoid(logits)  # s_i = Sigmoid(W_r x_i)   [T,E]
+
+        # Selection score s + b (bias only shifts WHO wins the Top-k).
+        sel = scores + self.bias[...] if self.bias_balancing else scores
+        sel = jax.lax.stop_gradient(sel)
+
+        # Optional group-limited routing (OFF by default — see the class
+        # docstring). Score each expert group by the sum of its top-2 selection
+        # scores, keep the token's best `topk_groups` groups, mask the rest.
+        if self.n_groups > 1:
+            T = sel.shape[0]
+            gsize = self.E // self.n_groups
+            sel_g = sel.reshape(T, self.n_groups, gsize)
+            top2, _ = jax.lax.top_k(sel_g, min(2, gsize))
+            _, gidx = jax.lax.top_k(top2.sum(-1), self.topk_groups)
+            keep = (
+                jnp.zeros((T, self.n_groups), bool)
+                .at[jnp.arange(T)[:, None], gidx]
+                .set(True)
+            )
+            sel = jnp.where(jnp.repeat(keep, gsize, axis=-1), sel, -jnp.inf)
+
+        sel_top, idx_top = jax.lax.top_k(sel, self.top_k + 1)
+        top_idx, cutoff = idx_top[:, : self.top_k], sel_top[:, self.top_k]
+
+        # p_{i,j} = s_{i,j} / Σ_{r ∈ T_i} s_{i,r} — mixture weights from the TRUE
+        # (un-biased) affinities of the selected experts, so the router keeps
+        # exact gradients.
+        gate = jnp.take_along_axis(scores, top_idx, axis=-1)
+        if self.norm_topk:
+            gate = gate / (gate.sum(-1, keepdims=True) + 1e-9)
+        gate = gate * self.routed_scale
+
+        return Routing(top_idx, gate, logits, scores, cutoff)
+
+    def balance(self, routing: Routing) -> jax.Array:
+        """The NEXT selection bias, per Quantile Balancing (Eq. 14) -> [E].
+
+        Computed from this batch but applied by the training loop AFTER the step:
+        "the update takes effect only in the next step, i.e. a batch is never
+        routed with a bias derived from itself" (§2.3.3). See
+        `quantile_balancing_bias` for the derivation.
+        """
+        return quantile_balancing_bias(routing.scores, routing.cutoff, self.top_k)
+
+    def aux_loss(self, routing: Routing, load: jax.Array) -> jax.Array:
+        """The Switch/DeepSeek-style auxiliary load-balancing loss.
+
+        K3 is auxiliary-loss-FREE (§2.3.3), so `aux_alpha` is 0 by default and
+        this returns exactly zero. Kept as a comparison knob: E·<f_e, P_e> with
+        f_e the realized load (a constant, no gradient) and P_e the mean routing
+        probability, which is where a gradient would flow. It reuses the logits
+        already in `routing`, so enabling it costs no second router matmul.
+        """
+        if not self.aux_alpha:
+            return jnp.zeros((), F32)
+        probs = jax.nn.softmax(routing.logits, axis=-1).mean(0)
+        return self.aux_alpha * self.E * jnp.sum(load * probs)
+
+
+# --------------------------------------------------------------------------- #
+#  The ROUTED branch of Eq. 11:  W↑ RMSNorm( Σ_{i∈T_k(x)} p_i E_i(W↓x) )
+# --------------------------------------------------------------------------- #
+class RoutedExperts(nnx.Module):
+    """The sparse, LATENT-WIDTH half of Stable LatentMoE (Eq. 11, second term).
+
+    Given a `Routing` — produced by `Router`, not by this class — it applies the
+    selected experts and returns the branch's contribution at model width. It
+    owns the latent bottleneck W↓/W↑, the stacked expert bank, the
+    dispatch/grouped-GEMM/combine machinery, and the §2.3.1 RMSNorm; it owns no
+    part of the routing DECISION.
+
+    THE LATENT IS THE POINT. In a conventional MoE each selected expert receives
+    the full d-dimensional token, so communication and expert-weight traffic grow
+    with how many experts a token activates — and K3 wants 16 of them. Here the
+    token is down-projected ONCE to width ℓ (K3: 0.5·d) and only that ℓ-vector is
+    dispatched, so raising top_k no longer raises the per-token traffic
+    proportionally in d. Shared experts (see `SharedExperts`) keep the full-width
+    path, so nothing is lost overall — the two branches divide the work.
+
+    Args:
+        d_model:    model width d, the width W↓/W↑ bridge to and from.
+        d_ff:       per-expert hidden width (SiTU-GLU inner dim), in latent space.
+        latent_dim: routed-expert width ℓ. ℓ = d recovers a conventional MoE.
+        n_routed:   number of experts E (K3: 896). Must match the router's.
+        beta1/beta2: SiTU-GLU soft caps (K3: 4 and 25).
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        d_ff: int,
+        latent_dim: int | None = None,
+        n_routed: int = 896,
+        *,
+        beta1: float = 4.0,
+        beta2: float = 25.0,
+        rms_eps: float = 1e-5,
+        compute_dtype: jnp.dtype = jnp.float32,
+        rngs: nnx.Rngs,
+    ):
+        self.d_model = d_model
+        self.latent = latent_dim if latent_dim is not None else d_model
+        self.d_ff = d_ff
+        self.E = n_routed
+        self.beta1, self.beta2 = beta1, beta2
+        # Matmul dtype for the expert grouped GEMMs (bf16 on H200). Weights are
+        # stored fp32; the combine (scatter-add) and the RMSNorm stay fp32.
+        self.compute_dtype = compute_dtype
 
         # --- The latent bottleneck of Eq. 11: W↓ (d -> ℓ) and W↑ (ℓ -> d). ---
         self.w_down = nnx.Linear(
@@ -353,81 +494,23 @@ class RoutedExperts(nnx.Module):
         )
 
     # ----------------------------------------------------------------------- #
-    def route(self, x_flat: jax.Array):
-        """Route tokens to experts (Eq. 13).
+    def __call__(
+        self, x_flat: jax.Array, routing: Routing
+    ) -> tuple[jax.Array, jax.Array]:
+        """x_flat: [T, d_model], routing from `Router` -> (y [T, d_model] fp32,
+        group_sizes [E]).
 
-        Returns (top_idx [T,k], gate [T,k], logits [T,E], scores [T,E], cutoff [T]).
+        Computes W↑ RMSNorm(u) with u = Σ_{i ∈ T_k(x)} p_i E_i(W↓x), i.e. the
+        routed half of Eq. 11 including its up-projection back to model width —
+        so the caller only has to add the shared branch.
 
-        Auxiliary-loss-free routing: the balancing bias is added ONLY to the
-        SELECTION score and under stop_gradient, so it decides WHICH experts a
-        token goes to but never appears in p_{i,j} nor in the router's gradient
-        (Eq. 13: "Because b is omitted from p_{i,j}, it regulates dispatch
-        without altering the mixture weights or the gradient-based optimization
-        of the router").
-
-        `cutoff` is the extra thing Quantile Balancing needs: selection runs
-        Top-(k+1) instead of Top-k, and the (k+1)-th biased score α_i is exactly
-        the bar an expert must clear to enter token i's Top-k. Getting it from
-        the routing pass itself is what lets QB derive the next bias from a
-        single forward with no separate token-side quantile (§2.3.3).
-        """
-        logits = self.router(x_flat).astype(F32)
-        scores = jax.nn.sigmoid(logits)  # s_i = Sigmoid(W_r x_i)   [T,E]
-
-        # Selection score s + b (bias only shifts WHO wins the Top-k).
-        sel = scores + self.router_bias[...] if self.bias_balancing else scores
-        sel = jax.lax.stop_gradient(sel)
-
-        # Optional group-limited routing (OFF by default — see the class docstring).
-        # Score each expert group by the sum of its top-2 selection scores, keep
-        # the token's best `topk_groups` groups, mask the rest to -inf.
-        if self.n_groups > 1:
-            T = sel.shape[0]
-            gsize = self.E // self.n_groups
-            sel_g = sel.reshape(T, self.n_groups, gsize)
-            top2, _ = jax.lax.top_k(sel_g, min(2, gsize))
-            _, gidx = jax.lax.top_k(top2.sum(-1), self.topk_groups)
-            keep = (
-                jnp.zeros((T, self.n_groups), bool)
-                .at[jnp.arange(T)[:, None], gidx]
-                .set(True)
-            )
-            sel = jnp.where(jnp.repeat(keep, gsize, axis=-1), sel, -jnp.inf)
-
-        # Top-(k+1): the first k entries are the routes taken, the last is the
-        # per-token cutoff α_i used by the QB update.
-        sel_top, idx_top = jax.lax.top_k(sel, self.top_k + 1)
-        top_idx, cutoff = idx_top[:, : self.top_k], sel_top[:, self.top_k]
-
-        # p_{i,j} = s_{i,j} / Σ_{r ∈ T_i} s_{i,r} — mixture weights from the TRUE
-        # (un-biased) affinities of the selected experts, so the router keeps
-        # exact gradients.
-        gate = jnp.take_along_axis(scores, top_idx, axis=-1)
-        if self.norm_topk:
-            gate = gate / (gate.sum(-1, keepdims=True) + 1e-9)
-        gate = gate * self.routed_scale
-
-        return top_idx, gate, logits, scores, cutoff
-
-    # ----------------------------------------------------------------------- #
-    def __call__(self, x_flat: jax.Array) -> tuple[jax.Array, dict[str, jax.Array]]:
-        """x_flat: [T, d_model] -> (y [T, d_model] in fp32, aux).
-
-        Computes W↑ RMSNorm(u) with u = Σ_{i ∈ T_k(x)} p_i E_i^routed(W↓x), i.e.
-        the routed half of Eq. 11 including its up-projection back to model
-        width — so the caller only has to add the shared branch.
-
-        aux carries what the training loop needs after the step:
-            qb_bias     [E]  the NEXT router bias from Quantile Balancing (Eq. 14)
-            group_sizes [E]  realized per-expert token counts (load diagnostics)
-            load        [E]  the same as a fraction
-            aux_loss    scalar, 0.0 unless aux_alpha > 0 (K3 is aux-loss-free)
+        `group_sizes` (per-expert token counts) falls out of the dispatch, which
+        needs it anyway; it is returned because the load diagnostics and the
+        optional aux loss are computed from it.
         """
         T = x_flat.shape[0]
-        k = self.top_k
+        k = routing.top_idx.shape[1]  # taken from the routing, not re-configured
         cd = self.compute_dtype
-
-        top_idx, gate, router_logits, scores, cutoff = self.route(x_flat)
 
         # ---- down-project ONCE per token: only the ℓ-wide latent is dispatched.
         # This is the whole economics of LatentMoE — a token activating k experts
@@ -436,9 +519,9 @@ class RoutedExperts(nnx.Module):
 
         # ---- dispatch: flatten the (token, expert) assignments, sort by expert
         # id so each expert's rows are contiguous, and record the run lengths.
-        flat_e = top_idx.reshape(T * k).astype(jnp.int32)  # expert per assignment
-        flat_tok = jnp.repeat(jnp.arange(T, dtype=jnp.int32), k)  # token per assignment
-        flat_w = gate.reshape(T * k).astype(F32)
+        flat_e = routing.top_idx.reshape(T * k).astype(jnp.int32)
+        flat_tok = jnp.repeat(jnp.arange(T, dtype=jnp.int32), k)
+        flat_w = routing.gate.reshape(T * k).astype(F32)
 
         order = jnp.argsort(flat_e)
         sort_tok = flat_tok[order]
@@ -462,43 +545,17 @@ class RoutedExperts(nnx.Module):
         # scale independent of which experts fired and how their weights fell,
         # so it is comparable with the full-width shared branch it is added to.
         y = self.w_up(self.u_norm(u).astype(cd)).astype(F32)
+        return y, group_sizes
 
-        # ---- balancing statistics -------------------------------------------
-        load = group_sizes.astype(F32) / (T * k)
-
-        # Next step's bias, per Quantile Balancing (Eq. 14). Computed here
-        # because it needs this batch's scores and cutoffs, but applied by the
-        # training loop AFTER the step: "the update takes effect only in the next
-        # step, i.e. a batch is never routed with a bias derived from itself".
-        qb_bias = quantile_balancing_bias(scores, cutoff, k)
-
-        # K3 is auxiliary-loss-free (§2.3.3), so aux_alpha = 0 by default and
-        # this term vanishes. Kept for comparison with the Switch/DeepSeek-style
-        # aux loss: E·<f_e, P_e> with f_e the realized load (constant) and P_e the
-        # mean routing probability (where a gradient would flow).
-        if self.aux_alpha:
-            probs = jax.nn.softmax(router_logits, axis=-1).mean(0)
-            aux_loss = self.aux_alpha * self.E * jnp.sum(load * probs)
-        else:
-            aux_loss = jnp.zeros((), F32)
-
-        aux = {
-            "load": load,
-            "aux_loss": aux_loss,
-            "group_sizes": group_sizes,
-            "qb_bias": qb_bias,
-        }
-        return y, aux
-
-    def dense_forward(self, x_flat: jax.Array) -> jax.Array:
+    def dense_forward(self, x_flat: jax.Array, routing: Routing) -> jax.Array:
         """Reference path computing every expert densely (for tests only).
         Uses the SAME weights as __call__, so any mismatch is a dispatch/GEMM bug."""
         T = x_flat.shape[0]
-        top_idx, gate, _, _, _ = self.route(x_flat)
-
         z = self.w_down(x_flat)
         full = (
-            jnp.zeros((T, self.E), F32).at[jnp.arange(T)[:, None], top_idx].add(gate)
+            jnp.zeros((T, self.E), F32)
+            .at[jnp.arange(T)[:, None], routing.top_idx]
+            .add(routing.gate)
         )  # [T,E] sparse mixture weights
         h = jnp.einsum("tl,elf->tef", z, self.w_in[...])  # [T,E,2*d_ff]
         g_, u_ = jnp.split(h, 2, axis=-1)
@@ -509,20 +566,26 @@ class RoutedExperts(nnx.Module):
 
 
 # --------------------------------------------------------------------------- #
-#  Stable LatentMoE = shared branch + routed branch
+#  Stable LatentMoE = router + routed branch + shared branch
 # --------------------------------------------------------------------------- #
 class StableLatentMoE(nnx.Module):
-    """Kimi K3 §2.3, Eq. 11 — the channel mixer, as the sum of its two branches:
+    """Kimi K3 §2.3, Eq. 11 — the channel mixer, assembled from three pieces:
 
         y = Σ_{j=1..N_s} E_j^shared(x)   +   W↑ RMSNorm( Σ_{i∈T_k(x)} p_i E_i^routed(W↓x) )
             └────── self.shared ──────┘       └───────────── self.routed ─────────────┘
+                                                    with T_k, p from self.router
 
-    The split is not cosmetic — it is the paper's central idea. The two branches
-    differ in EVERY dimension that matters: the shared one is dense, always-on,
-    and full-width; the routed one is sparse, selected, and confined to a latent
-    of width ℓ. That asymmetry is what lets K3 hold 896 experts and activate 16
-    of them per token without the communication cost a conventional MoE would
-    pay. See each class for its own half of the story; this one just adds them.
+    The shared/routed split is the paper's central idea: the two branches differ
+    in EVERY dimension that matters — the shared one is dense, always-on, and
+    full-width; the routed one is sparse, selected, and confined to a latent of
+    width ℓ. That asymmetry is what lets K3 hold 896 experts and activate 16 per
+    token without the communication cost a conventional MoE would pay.
+
+    The router is a third, separate piece because assignment and computation are
+    genuinely different concerns: `Router` answers "which experts, how strongly"
+    (Eq. 13, plus all of load balancing), `RoutedExperts` answers "what those
+    experts do". This class just wires them together and assembles the
+    diagnostics.
 
     Args:
         d_model:     model width d.
@@ -534,8 +597,8 @@ class StableLatentMoE(nnx.Module):
         n_routed:    number of routed experts E (K3: 896).
         n_shared:    number of always-on shared experts N_s (K3: 2).
         top_k:       experts activated per token (K3: 16).
-        Remaining keywords are forwarded to `RoutedExperts` — see it for routing,
-        group-limited candidates, and load-balancing options.
+        Remaining keywords are forwarded to `Router` — see it for group-limited
+        candidates and load-balancing options.
     """
 
     def __init__(
@@ -563,6 +626,18 @@ class StableLatentMoE(nnx.Module):
         self.d_model = d_model
         self.compute_dtype = compute_dtype
 
+        self.router = Router(
+            d_model,
+            n_routed=n_routed,
+            top_k=top_k,
+            n_groups=n_groups,
+            topk_groups=topk_groups,
+            norm_topk=norm_topk,
+            routed_scale=routed_scale,
+            bias_balancing=bias_balancing,
+            aux_alpha=aux_alpha,
+            rngs=rngs,
+        )
         self.shared = SharedExperts(
             d_model,
             d_ff_shared if d_ff_shared is not None else d_ff,
@@ -577,15 +652,8 @@ class StableLatentMoE(nnx.Module):
             d_ff,
             latent_dim=latent_dim,
             n_routed=n_routed,
-            top_k=top_k,
-            n_groups=n_groups,
-            topk_groups=topk_groups,
-            norm_topk=norm_topk,
-            routed_scale=routed_scale,
             beta1=beta1,
             beta2=beta2,
-            bias_balancing=bias_balancing,
-            aux_alpha=aux_alpha,
             rms_eps=rms_eps,
             compute_dtype=compute_dtype,
             rngs=rngs,
@@ -593,24 +661,35 @@ class StableLatentMoE(nnx.Module):
 
     @property
     def router_bias(self) -> nnx.Variable:
-        """Forwarder to `self.routed.router_bias` (Eq. 13's selection bias b), so
-        callers such as `apply_quantile_balancing` need not know which branch
-        holds it. Returns the Variable itself, so `moe.router_bias[...] = b`
-        writes through."""
-        return self.routed.router_bias
+        """Forwarder to `self.router.bias` (Eq. 13's selection bias b), so callers
+        such as `apply_quantile_balancing` need not know which sub-module holds
+        it. Returns the Variable itself, so `moe.router_bias[...] = b` writes
+        through."""
+        return self.router.bias
 
     def __call__(self, x: jax.Array) -> tuple[jax.Array, dict[str, jax.Array]]:
         """x: [B, L, d_model] -> (y, aux), i.e. Eq. 11 over a flattened batch.
 
-        aux comes straight from the routed branch (the shared branch has nothing
-        to balance); see `RoutedExperts.__call__` for its contents.
+        aux carries what the training loop needs after the step:
+            qb_bias     [E]  the NEXT router bias from Quantile Balancing (Eq. 14)
+            group_sizes [E]  realized per-expert token counts (load diagnostics)
+            load        [E]  the same as a fraction
+            aux_loss    scalar, 0.0 unless aux_alpha > 0 (K3 is aux-loss-free)
         """
         B, L, d = x.shape
         xf = x.reshape(B * L, d)
 
-        routed, aux = self.routed(xf)  # already fp32, already up-projected
-        out = routed + self.shared(xf).astype(F32)
+        routing = self.router(xf)  # Eq. 13: who goes where
+        routed, group_sizes = self.routed(xf, routing)  # Eq. 11's second term
+        out = routed + self.shared(xf).astype(F32)  # + the first term
 
+        load = group_sizes.astype(F32) / (B * L * self.router.top_k)
+        aux = {
+            "load": load,
+            "aux_loss": self.router.aux_loss(routing, load),
+            "group_sizes": group_sizes,
+            "qb_bias": self.router.balance(routing),
+        }
         return out.reshape(B, L, d).astype(self.compute_dtype), aux
 
     def dense_forward(self, x: jax.Array) -> jax.Array:
@@ -618,7 +697,8 @@ class StableLatentMoE(nnx.Module):
         Uses the SAME weights as __call__, so any mismatch is a dispatch/GEMM bug."""
         B, L, d = x.shape
         xf = x.reshape(B * L, d)
-        out = self.routed.dense_forward(xf) + self.shared(xf)
+        routing = self.router(xf)
+        out = self.routed.dense_forward(xf, routing) + self.shared(xf)
         return out.reshape(B, L, d)
 
 
