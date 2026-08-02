@@ -445,7 +445,7 @@ class RoutedExperts(nnx.Module):
         *,
         beta1: float = 4.0,
         beta2: float = 25.0,
-        rms_eps: float = 1e-5,
+        u_norm_eps: float = 1e-8,
         compute_dtype: jnp.dtype = jnp.float32,
         rngs: nnx.Rngs,
     ):
@@ -470,7 +470,19 @@ class RoutedExperts(nnx.Module):
         )
         # §2.3.1: RMSNorm sits BETWEEN expert aggregation and W↑, so W↑ always
         # sees a unit-scale input no matter which experts fired.
-        self.u_norm = RMSNorm(self.latent, eps=rms_eps)
+        #
+        # eps is NOT the model-wide rms_eps here, and that is deliberate. This
+        # norm sees `u`, which lives on a far smaller scale than a residual
+        # stream: a GLU is second-order small for small pre-activations, so at
+        # init RMS(u) ~ 1e-2 and the usual 1e-5 would be ~8% of mean(u²). The
+        # normalizer would then be dominated by eps rather than by u, and the
+        # branch would NOT be scale-invariant — measured, scaling the routing
+        # weights 5x moves the normalized output by 17.7% at eps=1e-5, 2.5% at
+        # 1e-6, and 0.03% at 1e-8. Since scale-invariance is the entire point of
+        # §2.3.1, eps must be small relative to u, not to the residual stream.
+        # u = 0 exactly is still safe: rsqrt(0 + eps) is finite and multiplies a
+        # zero vector.
+        self.u_norm = RMSNorm(self.latent, eps=u_norm_eps)
         self.w_up = nnx.Linear(
             self.latent,
             d_model,
@@ -619,7 +631,8 @@ class StableLatentMoE(nnx.Module):
         beta2: float = 25.0,
         bias_balancing: bool = True,
         aux_alpha: float = 0.0,
-        rms_eps: float = 1e-5,
+        rms_eps: float = 1e-5,  # accepted for interface parity; see u_norm_eps
+        u_norm_eps: float = 1e-8,
         compute_dtype: jnp.dtype = jnp.float32,
         rngs: nnx.Rngs,
     ):
@@ -654,7 +667,7 @@ class StableLatentMoE(nnx.Module):
             n_routed=n_routed,
             beta1=beta1,
             beta2=beta2,
-            rms_eps=rms_eps,
+            u_norm_eps=u_norm_eps,
             compute_dtype=compute_dtype,
             rngs=rngs,
         )

@@ -1,30 +1,50 @@
 """NoPE Gated Multi-head Latent Attention (MLA) — the FULL-attention token mixer.
 
-In the Kimi K3 hybrid (§2.1), each block is 3 linear-attention layers followed by
-1 Gated MLA layer, plus one extra Gated MLA at the very end of the backbone; this
-module is that full-attention layer, in K3's exact flavor:
+In the Kimi K3 hybrid (§2.1) each block is 3 linear-attention layers followed by
+1 Gated MLA layer, plus one extra Gated MLA at the end of the backbone. This
+module is that layer, implementing what K3 §2.1.2 specifies.
 
-  * MLA (DeepSeek-V2 lineage): keys/values live in a small shared low-rank LATENT,
-    so the decode-time cache stores one latent vector per position instead of full
-    K and V — the whole point of MLA is that tiny KV cache.
-  * NoPE — NO positional encoding of any kind (K3 §2.1.2). The linear-attention
-    layers already encode position implicitly through their recurrence, so the
-    MLA layers are freed to do pure global content matching. K3 notes the second
-    benefit: with no positional parameters there is nothing to retune when
-    extending context (no RoPE base rescaling, no YaRN) — it extrapolates to 1M
-    tokens directly.
-  * GATED (K3 §2.1.2, Eq. 7): an input-dependent, channel-wise FULL-RANK output
-    gate, y_t = W_o[Sigmoid(W_g x_t) ⊙ õ_t]. This is new in K3 — Kimi Linear's
-    MLA layers were ungated — and matches the full-rank gate K3 also adopts for
-    its linear layers, letting each token modulate which channels it reads out of
-    global attention.
-  * Written in the ABSORBED form (see the class docstring): with no RoPE in the
-    way, the K/V up-projections fold into the neighboring matrices exactly, so the
-    latent itself serves as both K and V and never gets up-projected at runtime.
+WHAT MLA IS — AND THE TRAP
+--------------------------
+The paper's definition: "MLA compresses the key-value representation of each
+token into a low-dimensional latent vector c_t = W_c x_t. Instead of caching
+full head-specific keys and values, MLA caches c_t and reconstructs the content
+keys and values through learned up-projections during attention computation."
 
-Two paths, same math: `__call__` for full-sequence training (causal-masked matrix
-attention) and `step` for streaming decode (append the new latent to a preallocated
-cache, attend over it).
+Two words there carry the whole design and are easy to lose:
+
+  * SHARED — there is ONE latent per token, not one per head. Every head sees
+    all of it.
+  * HEAD-SPECIFIC, RECONSTRUCTED — each head owns learned up-projections W_UK^h
+    and W_UV^h that build ITS key and ITS value out of that whole latent.
+
+The cache therefore shrinks to `kv_lora_rank` numbers per token while each head
+still gets a full-rank, individually-learned key and value.
+
+The trap: slicing the latent into per-head blocks also shrinks the cache, and
+looks superficially similar — but it forces W_UK/W_UV block-diagonal and is
+grouped-query attention over a low-rank cache, not MLA. It pays MLA's memory and
+gets GQA's expressiveness. `_project_kv` below does the real thing: `kv_b_proj`
+maps the FULL latent to every head's key and value.
+
+K3's THREE SPECIFIC CHOICES (§2.1.2)
+------------------------------------
+  1. NoPE. No positional encoding of any kind on queries or keys. The linear
+     layers carry position through their recurrence, leaving these layers to do
+     pure global content matching. The paper notes the payoff: nothing
+     positional to retune when extending context — no RoPE base rescaling, no
+     YaRN — so it extrapolates to 1M directly.
+  2. Gated output, Eq. 7:   y_t = W_o[ Sigmoid(W_g x_t) ⊙ õ_t ]
+     where õ_t is the UNGATED MLA OUTPUT — the concatenated per-head value
+     outputs, AFTER W_UV and BEFORE W_o. W_g is full rank and reads x_t, so the
+     gate is input-dependent and channel-wise. New in K3; Kimi Linear's MLA was
+     ungated.
+  3. FP32 attention output. "To correct the biased rounding error that arises in
+     flash attention ... we keep the attention output in FP32 during training."
+     So the probs·V accumulation runs in fp32 here even under bf16 compute.
+
+Two paths, same math: `__call__` for full-sequence training, `step` for
+streaming prefill/decode against a preallocated latent cache.
 """
 
 from typing import NamedTuple
@@ -33,316 +53,285 @@ import jax
 import jax.numpy as jnp
 from flax import nnx
 
-# App. D.5: Xavier-uniform init with gain 2^{-2.5} (variance_scaling scale = gain² =
-# 2^{-5}), replacing Flax NNX's default Linear kernel init. Biases stay at zero.
+# App. D.5: Xavier-uniform init with gain 2^{-2.5} (variance_scaling scale =
+# gain² = 2^{-5}), replacing Flax NNX's default Linear kernel init.
 _XAVIER = nnx.initializers.variance_scaling(2**-5, "fan_avg", "uniform")
 
 F32 = jnp.float32
 
 
-class MLACache(NamedTuple):
-    """Streaming KV cache for the MLA layer. Thanks to MLA we cache only the small
-    COMPRESSED latent `l_kv` (one latent serves as BOTH K and V — see below), in a
-    preallocated [B, max_len, Hkv*Dh] buffer written at position `pos`. Unlike GDN-2's
-    fixed-size state, this GROWS with context: these full-attention layers are exactly
-    the ones that pay the long-context KV-cache cost in the hybrid (3:1 keeps them few)."""
+class RMSNorm(nnx.Module):
+    """RMSNorm applied to a low-rank latent before its up-projection.
 
-    l_kv: jax.Array  # [B, max_len, num_kv_heads*head_dim]  preallocated latent buffer
+    Used on both the query LoRA and the KV latent — the DeepSeek-V2/V3
+    arrangement K3 says it "retains". Without it the up-projection sees an input
+    whose scale drifts with the down-projection.
+    """
+
+    def __init__(self, dim: int, *, eps: float = 1e-6):
+        self.eps = eps
+        self.weight = nnx.Param(jnp.ones((dim,), F32))
+
+    def __call__(self, x: jax.Array) -> jax.Array:
+        xf = x.astype(F32)
+        xf = xf * jax.lax.rsqrt(jnp.mean(xf * xf, axis=-1, keepdims=True) + self.eps)
+        return (xf * self.weight[...]).astype(x.dtype)
+
+
+class MLACache(NamedTuple):
+    """Streaming cache for one MLA layer: the compressed latent, nothing else.
+
+    This is the headline property — one `kv_lora_rank`-wide vector per token
+    instead of H·(qk_head_dim + v_head_dim) for full per-head K and V. Per-head
+    keys and values are never stored; they are rebuilt from this on each step.
+    Unlike the linear layers' fixed-size recurrent state this still GROWS with
+    context, which is exactly why the hybrid keeps these layers to 1 in 4.
+    """
+
+    c_kv: jax.Array  # [B, max_len, kv_lora_rank]  preallocated latent buffer
     pos: jax.Array  # scalar int32: number of filled positions so far
 
 
-class GroupedQueryLatentAttention(nnx.Module):
-    """Grouped-Query attention over a low-rank KV *latent*, in MLA "absorbed" form.
+class GatedMultiLatentAttention(nnx.Module):
+    """Kimi K3 §2.1.2: NoPE Multi-head Latent Attention with a full-rank output gate.
 
-    This is NoPE (no rotary embeddings) Multi-head Latent Attention written in its
-    matrix-absorbed form, fused with GQA-style KV-head sharing. Each of the three
-    projections folds together two of the usual MLA matrices:
+    Args:
+        embed_dim:    model width d.
+        num_heads:    attention heads H (paper Table 1: 96).
+        kv_lora_rank: width of the shared compressed latent c_t — the ONLY thing
+                      cached. Every head reads all of it.
+        qk_head_dim:  per-head key/query width, reconstructed from the latent.
+        v_head_dim:   per-head value width, reconstructed from the latent.
+        q_lora_rank:  rank of the query down-projection; None applies a direct
+                      query projection. Queries are never cached, so this is
+                      purely a parameter-count choice.
+        output_gate:  K3 Eq. 7's gate. True is the K3 behaviour; False gives
+                      Kimi Linear's ungated MLA for comparison.
 
-        w_q_uk : W_Q  . W_UK   -> queries are produced *directly* in the
-                                  compressed K space, so they can dot against the
-                                  latent without an explicit key up-projection.
-        w_dkv  : W_DKV          -> down-projects x to the shared KV latent (c_kv).
-        w_uv_o : W_UV . W_O     -> up-projects the value latent and applies the
-                                  output projection in a single matmul.
-        w_gate : W_g            -> K3 Eq. 7's full-rank output gate, applied to
-                                  the value-latents just before w_uv_o.
-
-    Key consequence: because there is no RoPE, W_UK and W_UV can be absorbed away
-    *exactly*, and in the compressed latent space the keys and the values are the
-    same tensor. That is why a single `l_kv` plays the role of BOTH K and V below.
-
-    Note: `head_dim` here is the per-head latent (rank) dimension, not a
-    conventional attention head width.
+    NOTE ON RoPE: there is deliberately no `qk_rope_head_dim` here. In the
+    DeepSeek lineage a separate key component exists ONLY because RoPE cannot be
+    folded through an up-projection, so those dimensions must bypass the latent.
+    K3 is NoPE (§2.1.2), so that exemption does not apply and the paper describes
+    no such path — every key dimension comes from the shared latent.
     """
 
     def __init__(
         self,
         embed_dim: int,
-        num_q_heads: int,
-        num_kv_heads: int,
-        head_dim: int,
+        num_heads: int,
+        kv_lora_rank: int,
+        qk_head_dim: int,
+        v_head_dim: int,
         rngs: nnx.Rngs,
+        q_lora_rank: int | None = None,
         compute_dtype: jnp.dtype = F32,
-        output_gate: bool = True,  # K3 Eq. 7; False = Kimi Linear's ungated MLA
+        output_gate: bool = True,
+        rms_eps: float = 1e-6,
     ):
-        # Matmul dtype for the projections (bf16 on H200); the QK^T / softmax / AV
-        # core is upcast to fp32 below regardless, for a stable attention distribution.
+        for name, value in (
+            ("num_heads", num_heads),
+            ("kv_lora_rank", kv_lora_rank),
+            ("qk_head_dim", qk_head_dim),
+            ("v_head_dim", v_head_dim),
+        ):
+            if value <= 0:
+                raise ValueError(f"{name} must be positive, got {value}")
+        if q_lora_rank is not None and q_lora_rank <= 0:
+            raise ValueError(f"q_lora_rank must be positive or None, got {q_lora_rank}")
+
         self.compute_dtype = compute_dtype
-        # GQA constraint: every KV (latent) head must serve a whole number of
-        # query heads, so that `repeat` below tiles the latent evenly.
-        if num_q_heads % num_kv_heads != 0:
-            raise ValueError(
-                f"num_q_heads ({num_q_heads}) must be divisible by num_kv_heads ({num_kv_heads})."
+        self.num_heads = num_heads
+        self.kv_lora_rank = kv_lora_rank
+        self.qk_head_dim = qk_head_dim
+        self.v_head_dim = v_head_dim
+        self.q_lora_rank = q_lora_rank
+
+        q_width = num_heads * qk_head_dim
+        v_width = num_heads * v_head_dim
+
+        # ---- Queries. Optionally low-rank: down -> RMSNorm -> up. ------------
+        if q_lora_rank is None:
+            self.q_a_proj = None
+            self.q_a_norm = None
+        else:
+            self.q_a_proj = nnx.Linear(
+                embed_dim, q_lora_rank, use_bias=False, kernel_init=_XAVIER,
+                dtype=compute_dtype, param_dtype=F32, rngs=rngs,
             )
-
-        self.num_q_heads = num_q_heads
-        self.num_kv_heads = num_kv_heads
-        self.head_dim = head_dim
-
-        # How many query heads share each KV/latent head (the GQA group size).
-        self.group_size = num_q_heads // num_kv_heads
-
-        d_q = num_q_heads * head_dim  # total width of the query projection
-        d_kv = num_kv_heads * head_dim  # total width of the (shared) KV latent
-
-        # W_Q . W_UK absorbed: x -> queries already living in the latent K space.
-        self.w_q_uk = nnx.Linear(
-            embed_dim,
-            d_q,
-            use_bias=False,
-            kernel_init=_XAVIER,
-            dtype=compute_dtype,
-            param_dtype=F32,
-            rngs=rngs,
+            self.q_a_norm = RMSNorm(q_lora_rank, eps=rms_eps)
+        self.q_proj = nnx.Linear(
+            embed_dim if q_lora_rank is None else q_lora_rank,
+            q_width, use_bias=False, kernel_init=_XAVIER,
+            dtype=compute_dtype, param_dtype=F32, rngs=rngs,
         )
 
-        # W_DKV: x -> low-rank KV latent c_kv (one latent per KV head).
-        self.w_dkv = nnx.Linear(
-            embed_dim,
-            d_kv,
-            use_bias=False,
-            kernel_init=_XAVIER,
-            dtype=compute_dtype,
-            param_dtype=F32,
-            rngs=rngs,
+        # ---- W_DKV: x -> the shared compressed latent c_t. The only thing that
+        # ever enters the cache. ----------------------------------------------
+        self.kv_a_proj = nnx.Linear(
+            embed_dim, kv_lora_rank, use_bias=False, kernel_init=_XAVIER,
+            dtype=compute_dtype, param_dtype=F32, rngs=rngs,
+        )
+        self.kv_a_norm = RMSNorm(kv_lora_rank, eps=rms_eps)
+
+        # ---- W_UK and W_UV, fused into one projection OF THE FULL LATENT.
+        # Output is laid out head-major as [head, qk_head_dim | v_head_dim], so
+        # head h's key and value are each a learned function of every latent
+        # dimension. This is §2.1.2's "reconstructs the content keys and values
+        # through learned up-projections", and it is what makes this MLA rather
+        # than GQA over a low-rank cache. --------------------------------------
+        self.kv_b_proj = nnx.Linear(
+            kv_lora_rank, num_heads * (qk_head_dim + v_head_dim),
+            use_bias=False, kernel_init=_XAVIER,
+            dtype=compute_dtype, param_dtype=F32, rngs=rngs,
         )
 
-        # W_UV . W_O absorbed: value-latent -> up-projected, output-projected.
-        # This plays the role of W_o in K3 Eq. 7.
-        self.w_uv_o = nnx.Linear(
-            d_q,
-            embed_dim,
-            use_bias=False,
-            kernel_init=_XAVIER,
-            dtype=compute_dtype,
-            param_dtype=F32,
-            rngs=rngs,
-        )
-
-        # W_g of K3 Eq. 7: the FULL-RANK output gate. It reads the block input x
-        # (not the attention output), so the modulation is input-dependent, and
-        # it lives on the d_q axis — i.e. it gates the per-head value-latents
-        # BEFORE the absorbed W_UV·W_O, which is where the "ungated MLA output"
-        # õ_t of Eq. 7 sits in this factorization.
-        self.w_gate = (
+        # ---- Eq. 7: the full-rank, input-dependent output gate, and W_o. -----
+        self.gate_proj = (
             nnx.Linear(
-                embed_dim,
-                d_q,
-                use_bias=False,
-                kernel_init=_XAVIER,
-                dtype=compute_dtype,
-                param_dtype=F32,
-                rngs=rngs,
+                embed_dim, v_width, use_bias=False, kernel_init=_XAVIER,
+                dtype=compute_dtype, param_dtype=F32, rngs=rngs,
             )
             if output_gate
             else None
+        )
+        self.o_proj = nnx.Linear(
+            v_width, embed_dim, use_bias=False, kernel_init=_XAVIER,
+            dtype=compute_dtype, param_dtype=F32, rngs=rngs,
+        )
+
+    # ----------------------------------------------------------------------- #
+    def _project_q(self, x: jax.Array) -> jax.Array:
+        """x: [B, L, d] -> queries [B, H, L, qk_head_dim]. NoPE: nothing rotates."""
+        B, L, _ = x.shape
+        q = x if self.q_a_proj is None else self.q_a_norm(self.q_a_proj(x))
+        return self.q_proj(q).reshape(
+            B, L, self.num_heads, self.qk_head_dim
+        ).swapaxes(1, 2)
+
+    def _project_kv(self, c_kv: jax.Array) -> tuple[jax.Array, jax.Array]:
+        """Reconstruct per-head keys and values from the SHARED latent.
+
+        c_kv: [B, K, kv_lora_rank] -> (keys [B,H,K,qk], values [B,H,K,v]).
+
+        `kv_b_proj` consumes the whole latent, so every head's key and value
+        depend on every latent dimension — the property that distinguishes MLA
+        from slicing the latent per head. W_UK and W_UV are also distinct halves
+        of that projection, so a head's key and its value are different learned
+        functions of c_t, not the same tensor.
+        """
+        B, K, _ = c_kv.shape
+        kv = self.kv_b_proj(self.kv_a_norm(c_kv))
+        kv = kv.reshape(
+            B, K, self.num_heads, self.qk_head_dim + self.v_head_dim
+        ).swapaxes(1, 2)
+        return jnp.split(kv, [self.qk_head_dim], axis=-1)
+
+    def _attend(
+        self, queries: jax.Array, keys: jax.Array, values: jax.Array, mask: jax.Array
+    ) -> jax.Array:
+        """Scores -> mask -> softmax -> weighted values. Returns [B, L, H*v].
+
+        The softmax runs in fp32 (stable max/exp/sum even when the projections
+        ran in bf16), and — per §2.1.2 — so does the probs·V accumulation that
+        produces the attention output. The -inf mask is safe because every query
+        keeps at least its own position, so no row is fully masked and the
+        softmax cannot NaN.
+        """
+        B = queries.shape[0]
+        L = queries.shape[2]
+        logits = jnp.einsum("bhqd,bhkd->bhqk", queries, keys).astype(F32)
+        logits = logits / jnp.sqrt(self.qk_head_dim)
+        logits = jnp.where(mask, logits, -jnp.inf)
+        probs = jax.nn.softmax(logits, axis=-1)
+
+        # FP32 attention output (§2.1.2), not a downcast back to compute_dtype.
+        o_tilde = jnp.einsum("bhqk,bhkd->bhqd", probs, values.astype(F32))
+        return o_tilde.swapaxes(1, 2).reshape(
+            B, L, self.num_heads * self.v_head_dim
         )
 
     def _gated_out(self, o_tilde: jax.Array, x: jax.Array) -> jax.Array:
         """K3 Eq. 7:  y_t = W_o[ Sigmoid(W_g x_t) ⊙ õ_t ].
 
-        o_tilde: [B, L, Hq*Dh] — the concatenated value-latents (the ungated MLA
-        output in absorbed form).  x: [B, L, embed_dim] — the block input.
-        Shared by the training and streaming paths so they cannot drift apart.
+        `o_tilde` is the ungated MLA output — per-head value outputs AFTER W_UV,
+        concatenated, [B, L, H*v_head_dim] — precisely Eq. 7's õ_t. It arrives in
+        fp32 and the gate is evaluated there too (a bf16 sigmoid would cost ~1e-2
+        on a factor multiplying every output channel, and GDN-2's identical K3
+        gate is computed in fp32); only then is it cast down for the W_o matmul.
         """
-        if self.w_gate is not None:
-            o_tilde = jax.nn.sigmoid(self.w_gate(x)) * o_tilde
-        return self.w_uv_o(o_tilde)
+        if self.gate_proj is not None:
+            o_tilde = jax.nn.sigmoid(self.gate_proj(x).astype(F32)) * o_tilde
+        return self.o_proj(o_tilde.astype(self.compute_dtype))
 
+    # ----------------------------------------------------------------------- #
     def __call__(self, x: jax.Array) -> jax.Array:
-        # x: (B, T, embed_dim)
-        batch_size, seq_length, _ = x.shape
+        """Full causal attention over a sequence. x: [B, L, d] -> [B, L, d].
 
-        # --- Queries (already in the compressed K space via the absorbed W_UK) ---
-        q_latent = self.w_q_uk(x)  # (B, T, num_q_heads * head_dim)
-
-        # Split the flat projection into per-head latent vectors.
-        q_reshaped = q_latent.reshape(
-            batch_size, seq_length, self.num_q_heads, self.head_dim
-        )  # (B, T, Hq, Dh)
-
-        # Move the head axis next to batch for batched matmuls: (B, Hq, T, Dh)
-        q_heads = q_reshaped.swapaxes(1, 2)
-
-        # --- Shared KV latent (serves as both keys and values) ---
-        l_kv = self.w_dkv(x)  # (B, T, num_kv_heads * head_dim)
-
-        l_kv_reshaped = l_kv.reshape(
-            batch_size, seq_length, self.num_kv_heads, self.head_dim
-        )  # (B, T, Hkv, Dh)
-
-        l_kv_heads = l_kv_reshaped.swapaxes(1, 2)  # (B, Hkv, T, Dh)
-
-        # GQA tiling: repeat each latent head `group_size` times so it lines up
-        # with the query heads. `repeat` interleaves, so KV head i feeds query
-        # heads [i*group_size : (i+1)*group_size]. Result: (B, Hq, T, Dh).
-        # (This materializes the full Hq KV stack; broadcasting would save memory
-        # but materializing keeps the einsums simple.)
-        l_kv_repeated = l_kv_heads.repeat(self.group_size, axis=1)
-
-        # --- Attention scores: Q . K^T, contracting the latent feature dim `d` ---
-        # 'd' is shared (contracted); 'k' indexes key/latent positions (kept).
-        qk_t = jnp.einsum("bhqd, bhkd -> bhqk", q_heads, l_kv_repeated)  # (B, Hq, T, T)
-
-        # Scale by sqrt of the latent per-head dim. Upcast to fp32 so the masking,
-        # softmax max/exp/sum are stable even when the projections ran in bf16.
-        scaled_logits = qk_t.astype(F32) / jnp.sqrt(self.head_dim)
-
-        # Causal mask (True = keep): future positions -> -inf so they vanish under
-        # softmax. Built at trace time from the actual sequence length — under jit
-        # this is a compile-time constant (folded by XLA), so nothing is stored in
-        # the module state or in checkpoints. Safe to use -inf because the diagonal
-        # is always kept (no fully-masked rows -> the softmax cannot NaN).
-        causal_mask = jnp.tril(jnp.ones((seq_length, seq_length), dtype=bool))
-        scaled_logits = jnp.where(causal_mask[None, None], scaled_logits, -jnp.inf)
-
-        # Softmax over the key axis -> per-query attention distribution (fp32), then
-        # back to the compute dtype for the (bf16) weighted-sum matmul below.
-        a = jax.nn.softmax(scaled_logits, axis=-1).astype(
-            l_kv_repeated.dtype
-        )  # (B, Hq, T, T)
-
-        # --- Weighted sum of value-latents ---
-        # 'k' is shared between the weights and the value positions, so it is the
-        # contracted axis (the actual attention sum); 'd' is the kept feature dim.
-        # Because keys and values are the same latent, l_kv_repeated reappears here.
-        weighted_heads = jnp.einsum(
-            "bhqk, bhkd -> bhqd", a, l_kv_repeated
-        )  # (B, Hq, T, Dh)
-
-        # Move head axis back and flatten heads: (B, T, Hq, Dh) -> (B, T, Hq*Dh)
-        weighted_reshaped = weighted_heads.swapaxes(1, 2)
-        weighted_latents = weighted_reshaped.reshape(
-            batch_size, seq_length, self.num_q_heads * self.head_dim
-        )
-
-        # Output gate (K3 Eq. 7) + absorbed W_UV . W_O: up-project the value
-        # latent and output-project.
-        output = self._gated_out(weighted_latents, x)  # (B, T, embed_dim)
-
-        return output
+        The training path, written the way §2.1.2 describes it: compress to the
+        latent, reconstruct per-head keys and values from it, attend.
+        """
+        L = x.shape[1]
+        queries = self._project_q(x)
+        keys, values = self._project_kv(self.kv_a_proj(x))
+        causal = jnp.tril(jnp.ones((L, L), dtype=bool))[None, None]
+        return self._gated_out(self._attend(queries, keys, values, causal), x)
 
     # ----------------------------------------------------------------------- #
-    #  Streaming / inference.  Same softmax attention, but the KV latents of past
-    #  positions are read from a preallocated cache instead of recomputed, and the
-    #  new positions are written into it.  Use it for prefill (L = prompt length)
-    #  and per-token decode (L = 1) alike.
-    # ----------------------------------------------------------------------- #
-    def init_cache(
-        self, batch_size: int, max_len: int, dtype=None
-    ) -> MLACache:
-        """Initialize the streaming KV cache for a given batch size and max length.
-        The cache is a preallocated buffer of shape [B, max_len, Hkv*Dh] and a
-        position counter. The buffer is filled with zeros initially.
+    def init_cache(self, batch_size: int, max_len: int, dtype=None) -> MLACache:
+        """Preallocate the latent cache.
 
-        The buffer dtype DEFAULTS TO THE LAYER'S compute_dtype, and that default
-        matters — do not override it with fp32 out of caution. The cache holds
-        w_dkv outputs, which are produced in compute_dtype; a wider buffer
-        silently promotes everything downstream of it, because `step` reads the
-        latent back out of the cache and JAX propagates the wider type through
-        the QK einsum, the attention weights, and the AV matmul. Decode would
-        then run its whole attention core in fp32 while training runs it in bf16
-        — the two paths stop agreeing (measured: 2.9e-3 relative on one layer,
-        ~8e-2 through a 9-layer stack), and the fp32 buffer also doubles the KV
-        cache, which is the one thing MLA exists to shrink.
-
-        Passing an explicit dtype is still supported for deliberate choices (e.g.
-        an fp32 cache with fp32 compute), but it must be a choice."""
-        d_kv = self.num_kv_heads * self.head_dim
+        The buffer dtype DEFAULTS TO compute_dtype and that default matters — do
+        not widen it to fp32 "to be safe". `step` reads the latent back out and
+        JAX propagates the wider type through everything downstream, so an fp32
+        buffer silently runs decode's whole attention core in fp32 while training
+        runs it in bf16, and the two paths stop agreeing. It would also double
+        the KV cache, the one thing MLA exists to shrink.
+        """
         return MLACache(
-            l_kv=jnp.zeros((batch_size, max_len, d_kv), dtype or self.compute_dtype),
+            c_kv=jnp.zeros(
+                (batch_size, max_len, self.kv_lora_rank),
+                dtype or self.compute_dtype,
+            ),
             pos=jnp.array(0, jnp.int32),
         )
 
     def step(self, x: jax.Array, cache: MLACache) -> tuple[jax.Array, MLACache]:
-        """Process a new chunk of input x, updating the cache and returning the output.
-        x: [B, L, embed_dim]  cache: MLACache with l_kv: [B, max_len, Hkv*Dh], pos: scalar int32
+        """Cached prefill or decode. Same projections and same math as `__call__`.
 
-        NUMERICS: attention here reduces over all `max_len` cache slots, while
-        `__call__` reduces over just the T real positions. The padding slots
-        contribute exact zeros (masked to -inf, so their softmax weight is 0, and
-        unfilled latents are 0), so the two are equal in exact arithmetic — but
-        XLA tiles a length-max_len reduction differently from a length-T one, and
-        under bf16 the resulting accumulation order costs about one ULP per layer.
-        Measured on the demo model: an unpadded cache (max_len == prompt length)
-        reproduces the training forward BIT FOR BIT, while any padding gives
-        ~7e-3 relative end to end; in fp32 it is ~1e-7 either way.
+        COST NOTE. The cache is a preallocated [B, max_len, kv_lora_rank] buffer
+        and the causal mask is applied after the scores, so the reconstruction
+        below runs over the FULL capacity every step — empty slots included. That
+        is O(max_len · kv_lora_rank · H · (qk+v)) per step.
 
-        This is left as-is deliberately. Removing it would mean slicing the cache
-        to the live region, whose length is a TRACED value during decode — the
-        slice size would have to become static, so every decode step would
-        retrace, destroying the compile-once property `KimiK3.generate` depends
-        on. Paying one ULP to keep one compiled trace is the right trade; if you
-        need bit-exactness for a fixed-length prefill, size the cache to the
-        prompt."""
+        Because K3 is NoPE, W_UK and W_UV can instead be absorbed EXACTLY into
+        the query and the output ((q·W_UK)·c^T = q·(W_UK·c)^T and
+        probs·(c·W_UV) = (probs·c)·W_UV), which removes the H·(qk+v) factor from
+        everything that touches the cache. That is the right optimization for
+        long-context decode and it changes no result in exact arithmetic — but it
+        reassociates the sums, so it does not reproduce `__call__` bit for bit
+        (measured ~1 ULP per layer in bf16). The reconstruction form is kept here
+        because §2.1.2 describes reconstruction and because train/decode
+        agreement is worth more at this scale than decode throughput.
+        """
         B, L, _ = x.shape
-        max_len = cache.l_kv.shape[1]
+        max_len = cache.c_kv.shape[1]
+        if L > max_len:
+            raise ValueError(f"input length {L} exceeds cache capacity {max_len}")
         new_pos = cache.pos + L
 
-        # Queries for the new positions (already in the compressed K space via W_UK).
-        q_heads = (
-            self.w_q_uk(x).reshape(B, L, self.num_q_heads, self.head_dim).swapaxes(1, 2)
-        )  # (B, Hq, L, Dh)
-
-        # New latents -> write them into the cache buffer at the current position.
-        l_new = self.w_dkv(x)  # (B, L, Hkv*Dh)
-        l_kv = jax.lax.dynamic_update_slice(
-            cache.l_kv, l_new.astype(cache.l_kv.dtype), (0, cache.pos, 0)
+        queries = self._project_q(x)
+        c_new = self.kv_a_proj(x)
+        c_kv = jax.lax.dynamic_update_slice(
+            cache.c_kv, c_new.astype(cache.c_kv.dtype), (0, cache.pos, 0)
         )
+        keys, values = self._project_kv(c_kv)
 
-        # --- Shared KV latent (serves as both keys and values) ---
-        l_kv_heads = l_kv.reshape(
-            B, max_len, self.num_kv_heads, self.head_dim
-        ).swapaxes(1, 2)  # (B, Hkv, max_len, Dh)
-        l_kv_rep = l_kv_heads.repeat(self.group_size, axis=1)  # (B, Hq, max_len, Dh)
+        # Causal mask offset by the cache position: query i sits at absolute
+        # position pos+i and may read slot j iff j <= pos+i. This also masks the
+        # not-yet-filled slots, so no separate validity mask is needed.
+        q_pos = cache.pos + jnp.arange(L)
+        k_pos = jnp.arange(max_len)
+        mask = (k_pos[None, :] <= q_pos[:, None])[None, None]
 
-        # Scores: the L new queries attend over all max_len cached slots. The
-        # einsum runs in compute_dtype and only its RESULT is upcast for the
-        # masking/softmax — exactly as in __call__, which is what makes the two
-        # paths agree bit for bit. That parity depends on the cache being
-        # compute_dtype (see init_cache): an fp32 buffer would promote this
-        # einsum's operands and silently move the whole core to fp32.
-        logits = jnp.einsum("bhqd, bhkd -> bhqk", q_heads, l_kv_rep).astype(
-            F32
-        ) / jnp.sqrt(self.head_dim)
-
-        # Causal mask offset by the cache position: query i sits at absolute position
-        # pos+i and may attend to slot j iff j <= pos+i.  This also masks the not-yet-
-        # filled slots (j >= pos+L > pos+i), so no separate validity mask is needed.
-        q_pos = cache.pos + jnp.arange(L)  # (L,)
-        k_pos = jnp.arange(max_len)  # (max_len,)
-        mask = k_pos[None, :] <= q_pos[:, None]  # (L, max_len)
-        logits = jnp.where(mask[None, None], logits, -jnp.inf)
-
-        # Softmax over the key axis (fp32) -> back to the compute dtype for the
-        # weighted-sum matmul, exactly as in __call__.
-        a = jax.nn.softmax(logits, axis=-1).astype(l_kv_rep.dtype)
-
-        # Weighted sum of value-latents: the same latent serves as both K and V.
-        weighted = jnp.einsum("bhqk, bhkd -> bhqd", a, l_kv_rep)  # (B, Hq, L, Dh)
-        weighted = weighted.swapaxes(1, 2).reshape(
-            B, L, self.num_q_heads * self.head_dim
-        )
-
-        output = self._gated_out(weighted, x)  # (B, L, embed_dim)
-        return output, MLACache(l_kv, new_pos)
+        o_tilde = self._attend(queries, keys, values, mask)
+        return self._gated_out(o_tilde, x), MLACache(c_kv, new_pos)

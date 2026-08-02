@@ -89,7 +89,7 @@ from jax.typing import ArrayLike
 # Reuse the building blocks already implemented and verified in this repo.
 from attention_residuals import AttnResReader
 from gated_deltanet_2.layer import GatedDeltaNet2, GDN2Cache, RMSNorm
-from multi_latent_attention.attention import GroupedQueryLatentAttention, MLACache
+from multi_latent_attention.attention import GatedMultiLatentAttention, MLACache
 from multi_latent_attention.moe import DenseFFN, StableLatentMoE
 
 # Xavier-uniform init with gain 2^{-2.5} (variance_scaling scale = gain² = 2^{-5})
@@ -161,9 +161,18 @@ class KimiK3Config:
     gdn_decay_min: float = -5.0  # g_min; K3 fixes -5
 
     # --- Gated MLA layers (NoPE) — multi_latent_attention/attention.py ---
-    mla_num_q_heads: int = 8  # query heads
-    mla_num_kv_heads: int = 2  # KV/latent heads (GQA); q_heads must be a multiple
-    mla_head_dim: int = 64  # per-head latent (rank) width
+    # MLA has ONE shared latent per token: `kv_lora_rank` is the whole cache
+    # width, and EVERY head reconstructs its own key and value from all of it
+    # (see attention.py — slicing it per head would be GQA, not MLA). Paper
+    # Table 1 gives H = 96; widths below are scaled to this demo model, keeping
+    # kv_lora_rank well under H*(qk+v) so the cache actually compresses.
+    mla_num_heads: int = 8  # H attention heads (paper: 96)
+    mla_kv_lora_rank: int = 64  # width of the shared latent c_t — the cache
+    mla_qk_head_dim: int = 32  # per-head key/query width
+    mla_v_head_dim: int = 32  # per-head value width
+    # Query down-projection rank; queries are never cached, so this only trades
+    # parameters. None uses a direct projection.
+    mla_q_lora_rank: int | None = 64
     # Declared context cap: used as the default size of the preallocated MLA
     # latent cache in init_cache/generate. (The causal mask itself is built on
     # the fly from the actual length.) Paper: 1M tokens — NoPE means there is no
@@ -254,11 +263,14 @@ class DecoderLayer(nnx.Module):
 
         if self.is_full_attn:
             # Full attention: NoPE Gated MLA (absorbed/GQA form), K3 §2.1.2.
-            self.token_mixer = GroupedQueryLatentAttention(
+            self.token_mixer = GatedMultiLatentAttention(
                 embed_dim=cfg.d_model,
-                num_q_heads=cfg.mla_num_q_heads,
-                num_kv_heads=cfg.mla_num_kv_heads,
-                head_dim=cfg.mla_head_dim,
+                num_heads=cfg.mla_num_heads,
+                kv_lora_rank=cfg.mla_kv_lora_rank,
+                qk_head_dim=cfg.mla_qk_head_dim,
+                v_head_dim=cfg.mla_v_head_dim,
+                q_lora_rank=cfg.mla_q_lora_rank,
+                rms_eps=cfg.rms_eps,
                 compute_dtype=cfg.cdtype,
                 output_gate=True,  # K3 Eq. 7
                 rngs=rngs,
@@ -392,7 +404,7 @@ class DecoderLayer(nnx.Module):
             # GDN-2: fixed-size recurrent state (O(1) per token).
             f, new_cache = self.token_mixer.step(h, cache)
         elif isinstance(cache, MLACache) and isinstance(
-            self.token_mixer, GroupedQueryLatentAttention
+            self.token_mixer, GatedMultiLatentAttention
         ):
             # Gated MLA: growing latent cache (O(context) per token).
             f, new_cache = self.token_mixer.step(h, cache)
@@ -521,7 +533,7 @@ class KimiK3(nnx.Module):
         "be safe" under bf16: both mixers read their caches back into the forward
         path, so a wider buffer promotes the arithmetic downstream of it and
         decode silently stops matching training (see
-        GroupedQueryLatentAttention.init_cache for the full account)."""
+        GatedMultiLatentAttention.init_cache for the full account)."""
         max_len = max_len or self.cfg.max_seq_len
         return [layer.init_cache(batch_size, max_len, dtype) for layer in self.layers]
 
