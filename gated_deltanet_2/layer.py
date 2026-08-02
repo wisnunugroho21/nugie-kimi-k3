@@ -680,21 +680,24 @@ class GatedDeltaNet2(nnx.Module):
         NUMERICS: "the exact same recurrence" is exact in ALGEBRA, not in
         floating point. The chunkwise and recurrent cores reassociate the same
         sums differently, so a chunk-aligned call reproduces `__call__` bit for
-        bit while a token-by-token call does not. Measured end to end on the
-        9-layer demo model, decode vs the training forward:
-
-            fp32   prefill 0        per-token 2.8e-6   (argmax 64/64, 64/64)
-            bf16   prefill 0        per-token ~1e-1    (argmax 64/64, 62/64)
+        bit (verified: the GDN-2 layers of the demo model show exactly 0 drift on
+        a chunk-aligned prefill, in fp32 and bf16 alike) while a token-by-token
+        call does not. Measured end to end on the 9-layer demo model, per-token
+        decode vs the training forward: 2.8e-6 in fp32, ~1e-1 in bf16, with
+        greedy argmax agreeing 64/64 and 62/64 respectively.
 
         Both cores run their internals in fp32 (core.py's D_TYPE) — the bf16 gap
         is one ULP entering through the projections and then compounding across
         the delta-rule recurrence and the depth stack. It is inherent to running
-        two different algorithms, not a bug, and it is why the per-token figure
-        cannot be driven to zero the way the prefill one was. Note the argmax
-        numbers come from a RANDOMLY INITIALIZED model, whose near-uniform logits
-        are the worst case for tie-breaking; trained logits are far more peaked.
-        If you need decode to match training bit for bit under bf16, feed
-        chunk-aligned blocks (prefill-style) rather than single tokens."""
+        two different algorithms, not a bug. Note the argmax numbers come from a
+        RANDOMLY INITIALIZED model, whose near-uniform logits are the worst case
+        for tie-breaking; trained logits are far more peaked. If you need decode
+        to match training closely under bf16, feed chunk-aligned blocks
+        (prefill-style) rather than single tokens.
+
+        (The MLA layers have a separate, much smaller padded-cache residual that
+        a chunk-aligned prefill does NOT remove — see
+        GroupedQueryLatentAttention.step.)"""
         q, k, v, g, b, w, new_conv = self._project(
             x, conv_states=(cache.q_conv, cache.k_conv, cache.v_conv)
         )

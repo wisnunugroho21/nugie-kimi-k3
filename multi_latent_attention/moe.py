@@ -118,6 +118,67 @@ class RMSNorm(nnx.Module):
 
 
 # --------------------------------------------------------------------------- #
+#  The SHARED branch of Eq. 11:  Σ_{j=1..N_s} E_j^shared(x)
+# --------------------------------------------------------------------------- #
+class SharedExperts(nnx.Module):
+    """The always-on, FULL-WIDTH half of Stable LatentMoE (Eq. 11, first term).
+
+    Every token goes through this path unconditionally — no router, no dispatch.
+    That is the division of labour the LatentMoE split exists to create: shared
+    experts "retain a full-width path for common transformations", while the
+    routed experts specialize in a compact latent (see `RoutedExperts`). What is
+    common to all tokens does not need to be selected, so it does not need to pay
+    for routing or for the down-projection's information loss.
+
+    K3 fixes N_s = 2 in every layer. The N_s experts are FOLDED INTO ONE wider
+    SiTU-GLU: summing N_s separate GLUs of hidden width H is exactly one GLU of
+    hidden width N_s·H, because the gate and up branches act per hidden unit and
+    the down-projection is linear. One matmul triple instead of N_s.
+
+    Shapes: d_model -> (n_shared · d_ff) -> d_model.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        d_ff: int,
+        n_shared: int = 2,
+        *,
+        beta1: float = 4.0,
+        beta2: float = 25.0,
+        compute_dtype: jnp.dtype = F32,
+        rngs: nnx.Rngs,
+    ):
+        self.beta1, self.beta2 = beta1, beta2
+        self.compute_dtype = compute_dtype
+        self.inner = d_ff * n_shared
+
+        kg, ku, kd = jax.random.split(rngs.params(), 3)
+        self.w_gate = nnx.Param(
+            jax.random.normal(kg, (d_model, self.inner), F32) * (d_model**-0.5)
+        )
+        self.w_up = nnx.Param(
+            jax.random.normal(ku, (d_model, self.inner), F32) * (d_model**-0.5)
+        )
+        self.w_down = nnx.Param(
+            jax.random.normal(kd, (self.inner, d_model), F32) * (self.inner**-0.5)
+        )
+
+    def __call__(self, x: jax.Array) -> jax.Array:
+        """x: [..., d_model] -> [..., d_model], in compute_dtype.
+
+        Left in compute_dtype rather than upcast: the caller decides the
+        precision of the sum it feeds into (StableLatentMoE adds this to the
+        routed branch in fp32)."""
+        cd = self.compute_dtype
+        xf = x.astype(cd)
+        a = situ_glu(
+            xf @ self.w_gate.astype(cd), xf @ self.w_up.astype(cd), self.beta1, self.beta2
+        )
+        return a @ self.w_down.astype(cd)
+
+
+# --------------------------------------------------------------------------- #
 #  Dense FFN — the "Number of Dense Layers: 1" row of Table 1.
 # --------------------------------------------------------------------------- #
 class DenseFFN(nnx.Module):
@@ -129,6 +190,11 @@ class DenseFFN(nnx.Module):
     on token identity and specialize experts by token rather than by function —
     a well-known source of early-training load collapse. One dense layer costs
     little and removes the problem.
+
+    Structurally this IS a shared expert — an always-on full-width SiTU-GLU — so
+    it wraps `SharedExperts` with n_shared = 1 rather than duplicating it. The
+    only thing it adds is the (y, aux) return signature that makes it drop-in
+    interchangeable with StableLatentMoE as a channel mixer.
     """
 
     def __init__(
@@ -141,47 +207,48 @@ class DenseFFN(nnx.Module):
         compute_dtype: jnp.dtype = F32,
         rngs: nnx.Rngs,
     ):
-        self.beta1, self.beta2 = beta1, beta2
-        self.compute_dtype = compute_dtype
-        kg, ku, kd = jax.random.split(rngs.params(), 3)
-        self.w_gate = nnx.Param(
-            jax.random.normal(kg, (d_model, d_ff), F32) * (d_model**-0.5)
-        )
-        self.w_up = nnx.Param(
-            jax.random.normal(ku, (d_model, d_ff), F32) * (d_model**-0.5)
-        )
-        self.w_down = nnx.Param(
-            jax.random.normal(kd, (d_ff, d_model), F32) * (d_ff**-0.5)
+        self.ffn = SharedExperts(
+            d_model,
+            d_ff,
+            n_shared=1,
+            beta1=beta1,
+            beta2=beta2,
+            compute_dtype=compute_dtype,
+            rngs=rngs,
         )
 
     def __call__(self, x: jax.Array) -> tuple[jax.Array, dict[str, jax.Array]]:
-        """Returns (y, aux) so it is drop-in interchangeable with StableLatentMoE.
-        The aux dict is empty — a dense FFN has nothing to load-balance."""
-        cd = self.compute_dtype
-        xf = x.astype(cd)
-        a = situ_glu(
-            xf @ self.w_gate.astype(cd), xf @ self.w_up.astype(cd), self.beta1, self.beta2
-        )
-        return (a @ self.w_down.astype(cd)).astype(x.dtype), {}
+        """Returns (y, aux). The aux dict is empty — a dense FFN has nothing to
+        load-balance."""
+        return self.ffn(x).astype(x.dtype), {}
 
 
 # --------------------------------------------------------------------------- #
-#  Stable LatentMoE
+#  The ROUTED branch of Eq. 11:  W↑ RMSNorm( Σ_{i ∈ T_k(x)} p_i E_i^routed(W↓x) )
 # --------------------------------------------------------------------------- #
-class StableLatentMoE(nnx.Module):
-    """Kimi K3 §2.3: token-dispatched grouped-GEMM MoE in a low-rank latent, with
-    shared experts, normalized aggregation, SiTU-GLU, and Quantile Balancing.
+class RoutedExperts(nnx.Module):
+    """The sparse, LATENT-WIDTH half of Stable LatentMoE (Eq. 11, second term).
+
+    Owns everything that makes routing work — the router and its balancing bias
+    (Eq. 13), the latent bottleneck W↓/W↑, the stacked expert bank, the
+    dispatch/grouped-GEMM/combine machinery, and the §2.3.1 RMSNorm — because
+    these are one interlocking mechanism: the router's top-k decides which rows
+    of the expert bank a token visits, and the normalization exists precisely to
+    absorb the scale variation that *that choice* introduces.
+
+    THE LATENT IS THE POINT. In a conventional MoE each selected expert receives
+    the full d-dimensional token, so communication and expert-weight traffic grow
+    with how many experts a token activates — and K3 wants 16 of them. Here the
+    token is down-projected ONCE to width ℓ (K3: 0.5·d) and only that ℓ-vector is
+    dispatched, so raising top_k no longer raises the per-token traffic
+    proportionally in d. Shared experts (see `SharedExperts`) keep the full-width
+    path, so nothing is lost overall — the two branches divide the work.
 
     Args:
-        d_model:     model width d.
-        latent_dim:  routed-expert width ℓ (K3: 0.5·d). ℓ = d recovers a
-                     conventional full-width MoE.
-        d_ff:        per-ROUTED-expert hidden width (SiTU-GLU inner dim), in latent space.
-        d_ff_shared: per-SHARED-expert hidden width (defaults to d_ff); shared
-                     experts run at FULL width d_model in and out.
-        n_routed:    number of routed experts E (K3: 896).
-        n_shared:    number of always-on shared experts N_s (K3: 2), folded into
-                     one wider SiTU-GLU.
+        d_model:     model width d (what the router scores, and what W↓/W↑ bridge).
+        latent_dim:  routed-expert width ℓ. ℓ = d recovers a conventional MoE.
+        d_ff:        per-expert hidden width (SiTU-GLU inner dim), in latent space.
+        n_routed:    number of experts E (K3: 896).
         top_k:       experts activated per token (K3: 16).
         n_groups / topk_groups: optional group-limited ("node-limited") routing
                      from DeepSeek-V3 / K2. K3 does not describe it — Quantile
@@ -191,8 +258,7 @@ class StableLatentMoE(nnx.Module):
         beta1/beta2: SiTU-GLU soft caps (K3: 4 and 25).
         bias_balancing: enable the auxiliary-loss-free selection bias.
         aux_alpha:   coefficient of the optional Switch-style aux loss. K3 is
-                     auxiliary-loss-FREE, so this defaults to 0.0; the term is
-                     kept only as a comparison/diagnostic knob.
+                     auxiliary-loss-FREE, so this defaults to 0.0.
     """
 
     def __init__(
@@ -201,10 +267,8 @@ class StableLatentMoE(nnx.Module):
         d_ff: int,
         latent_dim: int | None = None,
         n_routed: int = 896,
-        n_shared: int = 2,
         top_k: int = 16,
         *,
-        d_ff_shared: int | None = None,
         n_groups: int = 1,
         topk_groups: int = 1,
         norm_topk: bool = True,
@@ -238,9 +302,9 @@ class StableLatentMoE(nnx.Module):
         self.beta1, self.beta2 = beta1, beta2
         self.bias_balancing = bias_balancing
         self.aux_alpha = aux_alpha
-        # Matmul dtype for the expert grouped GEMMs + shared experts (bf16 on H200).
-        # Weights are stored fp32; the router, the combine (scatter-add), the
-        # RMSNorm and the QB statistics stay fp32 for stable routing/balancing.
+        # Matmul dtype for the expert grouped GEMMs (bf16 on H200). Weights are
+        # stored fp32; the router, the combine (scatter-add), the RMSNorm and the
+        # QB statistics stay fp32 for stable routing/balancing.
         self.compute_dtype = compute_dtype
 
         # --- Router (Eq. 13). Scores the FULL-WIDTH x, not the latent z: routing
@@ -276,7 +340,7 @@ class StableLatentMoE(nnx.Module):
             rngs=rngs,
         )
 
-        # --- Routed experts E_i: R^ℓ -> R^ℓ, weights stacked over the expert axis
+        # --- Expert bank E_i: R^ℓ -> R^ℓ, weights stacked over the expert axis
         # so the forward is two grouped GEMMs. Gate and up are fused into W_in,
         # so it is two rather than three. ---
         kin, kout = jax.random.split(rngs.params(), 2)
@@ -288,24 +352,8 @@ class StableLatentMoE(nnx.Module):
             jax.random.normal(kout, (n_routed, d_ff, self.latent), F32) * (d_ff**-0.5)
         )
 
-        # --- Shared experts E_j^shared: R^d -> R^d, at FULL width (that is the
-        # point of the split: common transformations keep the whole channel
-        # space). The N_s of them are folded into one wider SiTU-GLU, which is
-        # arithmetically the same as summing N_s separate ones. ---
-        sg, su, sd = jax.random.split(rngs.params(), 3)
-        ish = (d_ff_shared if d_ff_shared is not None else d_ff) * n_shared
-        self.ws_gate = nnx.Param(
-            jax.random.normal(sg, (d_model, ish), F32) * (d_model**-0.5)
-        )
-        self.ws_up = nnx.Param(
-            jax.random.normal(su, (d_model, ish), F32) * (d_model**-0.5)
-        )
-        self.ws_down = nnx.Param(
-            jax.random.normal(sd, (ish, d_model), F32) * (ish**-0.5)
-        )
-
     # ----------------------------------------------------------------------- #
-    def _route(self, x_flat: jax.Array):
+    def route(self, x_flat: jax.Array):
         """Route tokens to experts (Eq. 13).
 
         Returns (top_idx [T,k], gate [T,k], logits [T,E], scores [T,E], cutoff [T]).
@@ -361,19 +409,13 @@ class StableLatentMoE(nnx.Module):
 
         return top_idx, gate, logits, scores, cutoff
 
-    def _shared(self, x_flat: jax.Array) -> jax.Array:
-        """Σ_j E_j^shared(x) — the N_s shared experts as one wider SiTU-GLU, at
-        full model width. Runs in compute_dtype; the caller upcasts for the sum."""
-        cd = self.compute_dtype
-        xf = x_flat.astype(cd)
-        a = situ_glu(
-            xf @ self.ws_gate.astype(cd), xf @ self.ws_up.astype(cd), self.beta1, self.beta2
-        )
-        return a @ self.ws_down.astype(cd)
-
     # ----------------------------------------------------------------------- #
-    def __call__(self, x: jax.Array) -> tuple[jax.Array, dict[str, jax.Array]]:
-        """x: [B, L, d_model] -> (y, aux), implementing Eq. 11.
+    def __call__(self, x_flat: jax.Array) -> tuple[jax.Array, dict[str, jax.Array]]:
+        """x_flat: [T, d_model] -> (y [T, d_model] in fp32, aux).
+
+        Computes W↑ RMSNorm(u) with u = Σ_{i ∈ T_k(x)} p_i E_i^routed(W↓x), i.e.
+        the routed half of Eq. 11 including its up-projection back to model
+        width — so the caller only has to add the shared branch.
 
         aux carries what the training loop needs after the step:
             qb_bias     [E]  the NEXT router bias from Quantile Balancing (Eq. 14)
@@ -381,18 +423,16 @@ class StableLatentMoE(nnx.Module):
             load        [E]  the same as a fraction
             aux_loss    scalar, 0.0 unless aux_alpha > 0 (K3 is aux-loss-free)
         """
-        B, L, d = x.shape
-        T = B * L
+        T = x_flat.shape[0]
         k = self.top_k
-        xf = x.reshape(T, d)
         cd = self.compute_dtype
 
-        top_idx, gate, router_logits, scores, cutoff = self._route(xf)
+        top_idx, gate, router_logits, scores, cutoff = self.route(x_flat)
 
         # ---- down-project ONCE per token: only the ℓ-wide latent is dispatched.
         # This is the whole economics of LatentMoE — a token activating k experts
         # moves k copies of an ℓ-vector, not of a d-vector.
-        z = self.w_down(xf).astype(cd)  # [T, ℓ]
+        z = self.w_down(x_flat).astype(cd)  # [T, ℓ]
 
         # ---- dispatch: flatten the (token, expert) assignments, sort by expert
         # id so each expert's rows are contiguous, and record the run lengths.
@@ -418,11 +458,10 @@ class StableLatentMoE(nnx.Module):
         e_out = e_out.astype(F32) * sort_w[:, None]
         u = jnp.zeros((T, self.latent), F32).at[sort_tok].add(e_out)
 
-        # ---- Eq. 11's second line: y = Σ_j E_j^shared(x) + W↑ RMSNorm(u).
-        # The RMSNorm (§2.3.1) is what makes the routed branch's scale
-        # independent of which experts fired and how their weights fell.
-        routed = self.w_up(self.u_norm(u).astype(cd)).astype(F32)
-        out = (routed + self._shared(xf).astype(F32)).reshape(B, L, d).astype(cd)
+        # ---- W↑ RMSNorm(u). The RMSNorm (§2.3.1) is what makes this branch's
+        # scale independent of which experts fired and how their weights fell,
+        # so it is comparable with the full-width shared branch it is added to.
+        y = self.w_up(self.u_norm(u).astype(cd)).astype(F32)
 
         # ---- balancing statistics -------------------------------------------
         load = group_sizes.astype(F32) / (T * k)
@@ -449,18 +488,15 @@ class StableLatentMoE(nnx.Module):
             "group_sizes": group_sizes,
             "qb_bias": qb_bias,
         }
-        return out, aux
+        return y, aux
 
-    # ----------------------------------------------------------------------- #
-    def dense_forward(self, x: jax.Array) -> jax.Array:
+    def dense_forward(self, x_flat: jax.Array) -> jax.Array:
         """Reference path computing every expert densely (for tests only).
         Uses the SAME weights as __call__, so any mismatch is a dispatch/GEMM bug."""
-        B, L, d = x.shape
-        T = B * L
-        xf = x.reshape(T, d)
-        top_idx, gate, _, _, _ = self._route(xf)
+        T = x_flat.shape[0]
+        top_idx, gate, _, _, _ = self.route(x_flat)
 
-        z = self.w_down(xf)
+        z = self.w_down(x_flat)
         full = (
             jnp.zeros((T, self.E), F32).at[jnp.arange(T)[:, None], top_idx].add(gate)
         )  # [T,E] sparse mixture weights
@@ -469,7 +505,120 @@ class StableLatentMoE(nnx.Module):
         a = situ_glu(g_, u_, self.beta1, self.beta2)
         ye = jnp.einsum("tef,efl->tel", a, self.w_out[...])  # [T,E,ℓ]
         u = jnp.einsum("te,tel->tl", full, ye)
-        out = self.w_up(self.u_norm(u)) + self._shared(xf)
+        return self.w_up(self.u_norm(u))
+
+
+# --------------------------------------------------------------------------- #
+#  Stable LatentMoE = shared branch + routed branch
+# --------------------------------------------------------------------------- #
+class StableLatentMoE(nnx.Module):
+    """Kimi K3 §2.3, Eq. 11 — the channel mixer, as the sum of its two branches:
+
+        y = Σ_{j=1..N_s} E_j^shared(x)   +   W↑ RMSNorm( Σ_{i∈T_k(x)} p_i E_i^routed(W↓x) )
+            └────── self.shared ──────┘       └───────────── self.routed ─────────────┘
+
+    The split is not cosmetic — it is the paper's central idea. The two branches
+    differ in EVERY dimension that matters: the shared one is dense, always-on,
+    and full-width; the routed one is sparse, selected, and confined to a latent
+    of width ℓ. That asymmetry is what lets K3 hold 896 experts and activate 16
+    of them per token without the communication cost a conventional MoE would
+    pay. See each class for its own half of the story; this one just adds them.
+
+    Args:
+        d_model:     model width d.
+        latent_dim:  routed-expert width ℓ (K3: 0.5·d). ℓ = d recovers a
+                     conventional full-width MoE.
+        d_ff:        per-ROUTED-expert hidden width, in latent space.
+        d_ff_shared: per-SHARED-expert hidden width (defaults to d_ff); shared
+                     experts run at FULL width d_model in and out.
+        n_routed:    number of routed experts E (K3: 896).
+        n_shared:    number of always-on shared experts N_s (K3: 2).
+        top_k:       experts activated per token (K3: 16).
+        Remaining keywords are forwarded to `RoutedExperts` — see it for routing,
+        group-limited candidates, and load-balancing options.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        d_ff: int,
+        latent_dim: int | None = None,
+        n_routed: int = 896,
+        n_shared: int = 2,
+        top_k: int = 16,
+        *,
+        d_ff_shared: int | None = None,
+        n_groups: int = 1,
+        topk_groups: int = 1,
+        norm_topk: bool = True,
+        routed_scale: float = 1.0,
+        beta1: float = 4.0,
+        beta2: float = 25.0,
+        bias_balancing: bool = True,
+        aux_alpha: float = 0.0,
+        rms_eps: float = 1e-5,
+        compute_dtype: jnp.dtype = jnp.float32,
+        rngs: nnx.Rngs,
+    ):
+        self.d_model = d_model
+        self.compute_dtype = compute_dtype
+
+        self.shared = SharedExperts(
+            d_model,
+            d_ff_shared if d_ff_shared is not None else d_ff,
+            n_shared=n_shared,
+            beta1=beta1,
+            beta2=beta2,
+            compute_dtype=compute_dtype,
+            rngs=rngs,
+        )
+        self.routed = RoutedExperts(
+            d_model,
+            d_ff,
+            latent_dim=latent_dim,
+            n_routed=n_routed,
+            top_k=top_k,
+            n_groups=n_groups,
+            topk_groups=topk_groups,
+            norm_topk=norm_topk,
+            routed_scale=routed_scale,
+            beta1=beta1,
+            beta2=beta2,
+            bias_balancing=bias_balancing,
+            aux_alpha=aux_alpha,
+            rms_eps=rms_eps,
+            compute_dtype=compute_dtype,
+            rngs=rngs,
+        )
+
+    @property
+    def router_bias(self) -> nnx.Variable:
+        """Forwarder to `self.routed.router_bias` (Eq. 13's selection bias b), so
+        callers such as `apply_quantile_balancing` need not know which branch
+        holds it. Returns the Variable itself, so `moe.router_bias[...] = b`
+        writes through."""
+        return self.routed.router_bias
+
+    def __call__(self, x: jax.Array) -> tuple[jax.Array, dict[str, jax.Array]]:
+        """x: [B, L, d_model] -> (y, aux), i.e. Eq. 11 over a flattened batch.
+
+        aux comes straight from the routed branch (the shared branch has nothing
+        to balance); see `RoutedExperts.__call__` for its contents.
+        """
+        B, L, d = x.shape
+        xf = x.reshape(B * L, d)
+
+        routed, aux = self.routed(xf)  # already fp32, already up-projected
+        out = routed + self.shared(xf).astype(F32)
+
+        return out.reshape(B, L, d).astype(self.compute_dtype), aux
+
+    def dense_forward(self, x: jax.Array) -> jax.Array:
+        """Reference path computing every routed expert densely (for tests only).
+        Uses the SAME weights as __call__, so any mismatch is a dispatch/GEMM bug."""
+        B, L, d = x.shape
+        xf = x.reshape(B * L, d)
+        out = self.routed.dense_forward(xf) + self.shared(xf)
         return out.reshape(B, L, d)
 
 

@@ -276,7 +276,25 @@ class GroupedQueryLatentAttention(nnx.Module):
 
     def step(self, x: jax.Array, cache: MLACache) -> tuple[jax.Array, MLACache]:
         """Process a new chunk of input x, updating the cache and returning the output.
-        x: [B, L, embed_dim]  cache: MLACache with l_kv: [B, max_len, Hkv*Dh], pos: scalar int32"""
+        x: [B, L, embed_dim]  cache: MLACache with l_kv: [B, max_len, Hkv*Dh], pos: scalar int32
+
+        NUMERICS: attention here reduces over all `max_len` cache slots, while
+        `__call__` reduces over just the T real positions. The padding slots
+        contribute exact zeros (masked to -inf, so their softmax weight is 0, and
+        unfilled latents are 0), so the two are equal in exact arithmetic — but
+        XLA tiles a length-max_len reduction differently from a length-T one, and
+        under bf16 the resulting accumulation order costs about one ULP per layer.
+        Measured on the demo model: an unpadded cache (max_len == prompt length)
+        reproduces the training forward BIT FOR BIT, while any padding gives
+        ~7e-3 relative end to end; in fp32 it is ~1e-7 either way.
+
+        This is left as-is deliberately. Removing it would mean slicing the cache
+        to the live region, whose length is a TRACED value during decode — the
+        slice size would have to become static, so every decode step would
+        retrace, destroying the compile-once property `KimiK3.generate` depends
+        on. Paying one ULP to keep one compiled trace is the right trade; if you
+        need bit-exactness for a fixed-length prefill, size the cache to the
+        prompt."""
         B, L, _ = x.shape
         max_len = cache.l_kv.shape[1]
         new_pos = cache.pos + L
