@@ -168,6 +168,48 @@ def test_quantile_balancing_reduces_imbalance(cfg, update):
     assert float(after.sum()) == float(before.sum())  # every token still gets k experts
 
 
+def test_histogram_quantile_tracks_the_exact_one_as_bias_drifts(cfg):
+    """The histogram grid must follow the margins, not sit on a fixed range.
+
+    Margins are `s - alpha` with `alpha` taken from the *biased* score, so they
+    translate by roughly `-b` as training proceeds. A fixed grid (the original
+    [-1, 1]) put 94% of margins in the edge bins once the biases spread, and the
+    estimate collapsed. The error must stay at bin-width scale in every regime,
+    independent of where the margins sit.
+    """
+    moe = StableLatentMoE(cfg, rngs=nnx.Rngs(0))
+    x = jax.random.normal(jax.random.PRNGKey(3), (8, 64, cfg.hidden_size))
+
+    for spread in (0.0, 3.0, 20.0):
+        moe.router_bias[...] = jnp.linspace(-spread, spread, cfg.num_routed_experts)
+        _, stats = moe(x)
+        exact = quantile_balancing_update(stats, cfg.num_experts_per_token)
+        hist = quantile_balancing_update_histogram(stats, cfg.num_experts_per_token)
+        margins = stats.scores - stats.cutoff[:, None]
+        bin_width = float((margins.max(axis=0) - margins.min(axis=0)).max()) / 512
+        assert float(jnp.abs(exact - hist).max()) < 10 * bin_width, f"spread={spread}"
+
+
+def test_histogram_quantile_accepts_an_agreed_grid(cfg):
+    """`value_range` is how ranks share one grid so their counts stay additive."""
+    moe = StableLatentMoE(cfg, rngs=nnx.Rngs(0))
+    x = jax.random.normal(jax.random.PRNGKey(3), (4, 32, cfg.hidden_size))
+    _, stats = moe(x)
+    margins = stats.scores - stats.cutoff[:, None]
+
+    auto = quantile_balancing_update_histogram(stats, cfg.num_experts_per_token)
+    supplied = quantile_balancing_update_histogram(
+        stats, cfg.num_experts_per_token, value_range=(margins.min(axis=0), margins.max(axis=0))
+    )
+    assert jnp.allclose(auto, supplied)  # same grid => identical answer
+
+    # A scalar range broadcasts across experts.
+    scalar = quantile_balancing_update_histogram(
+        stats, cfg.num_experts_per_token, value_range=(-5.0, 5.0)
+    )
+    assert scalar.shape == (cfg.num_routed_experts,)
+
+
 def test_quantile_balancing_bias_is_zero_mean(cfg):
     """Eq. 14's second line: a common offset cannot change any Top-k decision."""
     moe = StableLatentMoE(cfg, rngs=nnx.Rngs(0))

@@ -124,8 +124,7 @@ def quantile_balancing_update_histogram(
     top_k: int,
     *,
     num_bins: int = 512,
-    lo: float = -1.0,
-    hi: float = 1.0,
+    value_range: tuple[jax.Array, jax.Array] | None = None,
 ) -> jax.Array:
     """The estimator K3 actually uses in training (§2.3.3, "Histogram estimation").
 
@@ -140,14 +139,43 @@ def quantile_balancing_update_histogram(
     up to one bin width, at a communication cost of a few hundred numbers per
     expert instead of millions.
 
-    (This single-device version does the binning and the read-off; in a
-    distributed run you would `jax.lax.psum` `counts` between the two.)
+    THE BIN GRID HAS TO FOLLOW THE DATA.  Margins are `s_ij - alpha_i`, and the
+    cutoff `alpha_i` is taken from the *biased* score, so the margins sit around
+    `-b_j` and drift with the bias as training proceeds. A fixed grid is
+    therefore wrong: once the biases spread out, every margin lands in the edge
+    bins and the estimate collapses to a constant. The range is derived per
+    expert from the margins themselves, which keeps the "exact up to one bin
+    width" guarantee unconditional.
+
+    DISTRIBUTED USE.  Counts are only additive if every rank bins on the SAME
+    grid, so the range must be agreed before binning — a min/max all-reduce of
+    two floats per expert, negligible beside the `num_bins` per expert that the
+    count all-reduce already costs:
+
+        lo = jax.lax.pmin(margins.min(axis=0), "dp")
+        hi = jax.lax.pmax(margins.max(axis=0), "dp")
+        bias = quantile_balancing_update_histogram(stats, k, value_range=(lo, hi))
+        # ... with `counts = jax.lax.psum(counts, "dp")` at the marker below.
+
+    Pass `value_range` to supply that agreed grid (or any fixed grid you can
+    bound analytically); omit it on a single device to derive it locally.
     """
     n_experts = stats.scores.shape[-1]
     margins = (stats.scores - stats.cutoff[:, None]).astype(F32)  # [N, E]
 
-    edges = jnp.linspace(lo, hi, num_bins + 1)
-    idx = jnp.clip(jnp.searchsorted(edges, margins, side="right") - 1, 0, num_bins - 1)
+    if value_range is None:
+        lo, hi = margins.min(axis=0), margins.max(axis=0)  # [E] each
+    else:
+        lo, hi = (jnp.broadcast_to(jnp.asarray(v, F32), (n_experts,)) for v in value_range)
+    # A degenerate span (every margin identical) would divide by zero; widening
+    # it puts all the mass in bin 0, which reads back as `lo` — the right answer.
+    span = jnp.maximum(hi - lo, 1e-6)
+
+    # Arithmetic binning rather than searchsorted, because the edges are now
+    # per expert: bin b of expert j covers [lo_j + b*span_j/B, lo_j + (b+1)*...).
+    idx = jnp.clip(
+        jnp.floor((margins - lo) / span * num_bins).astype(jnp.int32), 0, num_bins - 1
+    )
     # counts[b, j] = how many of expert j's margins fall in bin b
     counts = jnp.zeros((num_bins, n_experts), dtype=jnp.int32).at[idx, jnp.arange(n_experts)].add(1)
     # ---- a single all-reduce would go here: counts = jax.lax.psum(counts, "dp")
@@ -156,7 +184,13 @@ def quantile_balancing_update_histogram(
     target_rank = jnp.floor((1.0 - top_k / n_experts) * total).astype(jnp.int32)
     cdf = jnp.cumsum(counts, axis=0)  # [num_bins, E]
     bin_idx = (cdf < target_rank[None, :]).sum(axis=0)  # first bin reaching the rank
-    b_hat = -edges[jnp.clip(bin_idx, 0, num_bins - 1)]
+    # Interpolate inside the located bin instead of taking its lower edge: the
+    # rank is known exactly, so this recovers most of the within-bin resolution.
+    below = jnp.take_along_axis(cdf, jnp.clip(bin_idx - 1, 0, num_bins - 1)[None], axis=0)[0]
+    below = jnp.where(bin_idx == 0, 0, below)
+    in_bin = jnp.take_along_axis(counts, bin_idx[None], axis=0)[0]
+    frac = jnp.where(in_bin > 0, (target_rank - below) / jnp.maximum(in_bin, 1), 0.0)
+    b_hat = -(lo + (bin_idx + frac) * span / num_bins)
     return b_hat - b_hat.mean()
 
 
