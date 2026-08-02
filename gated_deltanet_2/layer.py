@@ -697,7 +697,7 @@ class GatedDeltaNet2(nnx.Module):
 
         (The MLA layers have a separate, much smaller padded-cache residual that
         a chunk-aligned prefill does NOT remove — see
-        GroupedQueryLatentAttention.step.)"""
+        GatedMultiLatentAttention.step.)"""
         q, k, v, g, b, w, new_conv = self._project(
             x, conv_states=(cache.q_conv, cache.k_conv, cache.v_conv)
         )
