@@ -37,7 +37,13 @@ from .moe import (
     quantile_balancing_update,
     quantile_balancing_update_histogram,
 )
-from .muon import cosine_schedule_with_warmup, kimi_k3_optimizer, newton_schulz, per_head_muon
+from .muon import (
+    cosine_schedule_with_warmup,
+    kimi_k3_optimizer,
+    muon_label_tree,
+    newton_schulz,
+    per_head_muon,
+)
 from .vision import MoonViTV2, VisionTower
 
 __all__ = [
@@ -63,6 +69,7 @@ __all__ = [
     "kda_recurrent",
     "kimi_k3_optimizer",
     "mtp_loss",
+    "muon_label_tree",
     "newton_schulz",
     "per_head_muon",
     "quantile_balancing_update",

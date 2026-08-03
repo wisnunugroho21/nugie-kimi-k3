@@ -73,6 +73,7 @@ class RouterStats(NamedTuple):
     scores: jax.Array  # [N, E]  raw sigmoid router scores s (no bias)
     cutoff: jax.Array  # [N]     alpha_i: the (k+1)-th largest biased score
     load: jax.Array  # [E]     tokens dispatched to each expert this batch
+    bias: jax.Array  # [E]     the bias b this batch was actually routed with
 
 
 # ===========================================================================
@@ -123,74 +124,83 @@ def quantile_balancing_update_histogram(
     stats: RouterStats,
     top_k: int,
     *,
-    num_bins: int = 512,
+    num_bins: int = 1_000,
     value_range: tuple[jax.Array, jax.Array] | None = None,
 ) -> jax.Array:
-    """The estimator K3 actually uses in training (§2.3.3, "Histogram estimation").
+    """The estimator K3 actually uses in training (§2.3.3; derived in Appendix D).
 
     The quantile in Eq. 14 is over the whole global batch: millions of margins,
     spread across data-parallel ranks and gradient-accumulation micro-steps.
     Gathering them to sort exactly is not viable. Instead each rank bins its own
-    margins per expert; a single all-reduce sums the bin counts; the quantile is
-    read off the pooled histogram.
+    values per expert; a single all-reduce sums the bin counts; the quantile is
+    read off the pooled histogram. Counts are ADDITIVE, so the pooled histogram
+    represents the true global batch no matter how tokens were sharded — the
+    estimate is the whole-batch quantile up to one bin width, at a communication
+    cost of `num_bins` integers per expert instead of millions of floats.
 
-    The trick is that counts are ADDITIVE, so the pooled histogram represents the
-    true global batch no matter how tokens were sharded — the estimate is exact
-    up to one bin width, at a communication cost of a few hundred numbers per
-    expert instead of millions.
+    WHAT IS BINNED.  Appendix D histograms the REQUIRED BIAS
 
-    THE BIN GRID HAS TO FOLLOW THE DATA.  Margins are `s_ij - alpha_i`, and the
-    cutoff `alpha_i` is taken from the *biased* score, so the margins sit around
-    `-b_j` and drift with the bias as training proceeds. A fixed grid is
-    therefore wrong: once the biases spread out, every margin lands in the edge
-    bins and the estimate collapses to a constant. The range is derived per
-    expert from the margins themselves, which keeps the "exact up to one bin
-    width" guarantee unconditional.
+        r_ij := alpha_i - s_ij
 
-    DISTRIBUTED USE.  Counts are only additive if every rank bins on the SAME
-    grid, so the range must be agreed before binning — a min/max all-reduce of
-    two floats per expert, negligible beside the `num_bins` per expert that the
-    count all-reduce already costs:
+    — the bias that would place expert j exactly at token i's cutoff. Negating
+    the margins reverses their order, so Eq. 14's `-quantile_{1-k/n}(s - alpha)`
+    is just the `(k/n)`-quantile of `r`, which is the target load q = m*k/n
+    counted from the bottom. No negation is needed at the end.
 
-        lo = jax.lax.pmin(margins.min(axis=0), "dp")
-        hi = jax.lax.pmax(margins.max(axis=0), "dp")
-        bias = quantile_balancing_update_histogram(stats, k, value_range=(lo, hi))
-        # ... with `counts = jax.lax.psum(counts, "dp")` at the marker below.
+    THE BIN RANGE IS ANALYTIC, NOT READ OFF THE DATA.  Router scores are sigmoid
+    outputs, so `s_ij` is in (0,1); the cutoff `alpha_i` is itself some biased
+    score `s_ij' + b_j'`, so it lies in `(b_min, 1 + b_max)`. Every `r_ij`
+    therefore falls in `[b_min - 1, b_max + 1]`, where b_min/b_max are the
+    extremes of the CURRENT bias. Two consequences:
 
-    Pass `value_range` to supply that agreed grid (or any fixed grid you can
-    bound analytically); omit it on a single device to derive it locally.
+      * the grid follows the bias as it spreads out to correct imbalance, so it
+        never degenerates the way a grid fixed at, say, [-1, 1] would;
+      * every rank can compute it from the bias it already holds, so the count
+        all-reduce below remains the estimator's ONLY communication. No prior
+        min/max exchange is needed to agree on a grid.
+
+    DISTRIBUTED USE.  Accumulate `counts` across micro-batches with no
+    communication, then one integer all-reduce per layer per step at the marker
+    below: `counts = jax.lax.psum(counts, "dp")`.
+
+    `value_range` overrides the analytic range with an explicit `(lo, hi)`,
+    scalar or per-expert. Appendix D also notes that an EMA of the estimated
+    quantiles across steps reduces batch-to-batch noise further; that is left to
+    the caller, since it is state the update itself does not carry.
     """
     n_experts = stats.scores.shape[-1]
-    margins = (stats.scores - stats.cutoff[:, None]).astype(F32)  # [N, E]
+    # r_ij = alpha_i - s_ij, the required bias (Appendix D).
+    r = (stats.cutoff[:, None] - stats.scores).astype(F32)  # [N, E]
 
     if value_range is None:
-        lo, hi = margins.min(axis=0), margins.max(axis=0)  # [E] each
+        b = stats.bias.astype(F32)
+        lo, hi = b.min() - 1.0, b.max() + 1.0
     else:
-        lo, hi = (jnp.broadcast_to(jnp.asarray(v, F32), (n_experts,)) for v in value_range)
-    # A degenerate span (every margin identical) would divide by zero; widening
-    # it puts all the mass in bin 0, which reads back as `lo` — the right answer.
-    span = jnp.maximum(hi - lo, 1e-6)
+        lo, hi = value_range
+    lo, hi = (jnp.broadcast_to(jnp.asarray(v, F32), (n_experts,)) for v in (lo, hi))
+    width = (hi - lo) / num_bins  # [E]; a scalar range gives one shared grid
 
-    # Arithmetic binning rather than searchsorted, because the edges are now
-    # per expert: bin b of expert j covers [lo_j + b*span_j/B, lo_j + (b+1)*...).
+    # Arithmetic binning rather than searchsorted: the edges are uniform, so the
+    # bin index is one divide. Values outside the range clamp into the end bins.
     idx = jnp.clip(
-        jnp.floor((margins - lo) / span * num_bins).astype(jnp.int32), 0, num_bins - 1
+        jnp.floor((r - lo) / jnp.maximum(width, 1e-12)).astype(jnp.int32), 0, num_bins - 1
     )
-    # counts[b, j] = how many of expert j's margins fall in bin b
+    # counts[b, j] = how many of expert j's required biases fall in bin b
     counts = jnp.zeros((num_bins, n_experts), dtype=jnp.int32).at[idx, jnp.arange(n_experts)].add(1)
     # ---- a single all-reduce would go here: counts = jax.lax.psum(counts, "dp")
 
-    total = counts.sum(axis=0)  # = N, per expert
-    target_rank = jnp.floor((1.0 - top_k / n_experts) * total).astype(jnp.int32)
+    # Each expert's histogram counts every token once, so the target rank is the
+    # target load q = m*k/n itself, taken over the full step.
+    q = r.shape[0] * top_k / n_experts
     cdf = jnp.cumsum(counts, axis=0)  # [num_bins, E]
-    bin_idx = (cdf < target_rank[None, :]).sum(axis=0)  # first bin reaching the rank
+    bin_idx = (cdf < jnp.ceil(q)).sum(axis=0)  # first bin whose count reaches ceil(q)
     # Interpolate inside the located bin instead of taking its lower edge: the
     # rank is known exactly, so this recovers most of the within-bin resolution.
-    below = jnp.take_along_axis(cdf, jnp.clip(bin_idx - 1, 0, num_bins - 1)[None], axis=0)[0]
-    below = jnp.where(bin_idx == 0, 0, below)
+    before = jnp.take_along_axis(cdf, jnp.clip(bin_idx - 1, 0, num_bins - 1)[None], axis=0)[0]
+    before = jnp.where(bin_idx == 0, 0, before)
     in_bin = jnp.take_along_axis(counts, bin_idx[None], axis=0)[0]
-    frac = jnp.where(in_bin > 0, (target_rank - below) / jnp.maximum(in_bin, 1), 0.0)
-    b_hat = -(lo + (bin_idx + frac) * span / num_bins)
+    frac = jnp.clip((q - before) / jnp.maximum(in_bin, 1), 0.0, 1.0)
+    b_hat = lo + (bin_idx + frac) * width
     return b_hat - b_hat.mean()
 
 
@@ -327,4 +337,4 @@ class StableLatentMoE(nnx.Module):
             y = y + expert(flat)
 
         load = jnp.bincount(expert_idx.reshape(-1), length=self.cfg.num_routed_experts)
-        return y.reshape(B, T, d), RouterStats(scores, cutoff, load)
+        return y.reshape(B, T, d), RouterStats(scores, cutoff, load, self.router_bias[...])

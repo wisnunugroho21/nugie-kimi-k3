@@ -22,7 +22,7 @@ import kimi_k3 as k3
 from kimi_k3.kda import KimiDeltaAttention, kda_chunkwise, kda_recurrent
 from kimi_k3.mla import GatedMLA
 from kimi_k3.moe import StableLatentMoE, quantile_balancing_update, quantile_balancing_update_histogram
-from kimi_k3.muon import orthogonalize, per_head_muon
+from kimi_k3.muon import muon_label_tree, orthogonalize, per_head_muon
 
 
 @pytest.fixture(scope="module")
@@ -79,6 +79,45 @@ def test_kda_decay_is_lower_bounded(cfg):
     alpha = kda._decay(x)
     assert float(alpha.min()) >= float(jnp.exp(jnp.array(cfg.kda_g_min)))
     assert float(alpha.max()) <= 1.0
+
+
+def test_kda_chunk_size_is_bounded_by_the_decay_floor():
+    """`chunk_size` is a numerical limit, not a knob: C=32 would silently NaN.
+
+    `A` is formed as a full (Q*Gamma)(K/Gamma)^T before it is masked, so its
+    upper triangle transiently holds ratios up to e^{-g_min*C}. At C=16 that is
+    e^80 (fine); at C=32 it is e^160 and every output is NaN. Randomly sampled
+    decays never reach the floor, so only a pinned-at-the-floor case exposes it.
+    """
+    q, k, v, _, beta = _kda_inputs()
+    alpha = jnp.full(q.shape, jnp.exp(-5.0))  # Eq. 5 floor everywhere
+    ref, _ = kda_recurrent(q, k, v, alpha, beta)
+
+    o, _ = kda_chunkwise(q, k, v, alpha, beta, chunk_size=16)
+    assert jnp.isfinite(o).all()
+    assert jnp.allclose(o, ref, atol=1e-4)
+
+    with pytest.raises(ValueError, match="chunk_size"):
+        kda_chunkwise(q, k, v, alpha, beta, chunk_size=32)
+
+
+def test_kda_mask_keeps_padding_out_of_the_recurrent_state(cfg):
+    """A padded token must not write to S — it has no position in the sequence.
+
+    MLA gets this from its logit mask; KDA has no logits, so padding is made
+    inert with beta=0 / alpha=1. Without it, garbage in the padded slots leaks
+    into every later token through the state.
+    """
+    kda = KimiDeltaAttention(cfg, rngs=nnx.Rngs(0))
+    x = jax.random.normal(jax.random.PRNGKey(1), (2, 12, cfg.hidden_size)) * 0.5
+    mask = jnp.arange(12)[None, :] < 8  # last 4 positions are padding
+    mask = jnp.broadcast_to(mask, (2, 12))
+
+    # Whatever the padded slots contain, the valid prefix must be unchanged...
+    noisy = x.at[:, 8:].set(jax.random.normal(jax.random.PRNGKey(2), (2, 4, cfg.hidden_size)) * 50)
+    assert jnp.allclose(kda(x, mask)[:, :8], kda(noisy, mask)[:, :8], atol=1e-5)
+    # ...and must equal simply not passing those tokens at all.
+    assert jnp.allclose(kda(x, mask)[:, :8], kda(x[:, :8])[:, :8], atol=1e-5)
 
 
 def test_kda_streaming_matches_forward(cfg):
@@ -169,13 +208,14 @@ def test_quantile_balancing_reduces_imbalance(cfg, update):
 
 
 def test_histogram_quantile_tracks_the_exact_one_as_bias_drifts(cfg):
-    """The histogram grid must follow the margins, not sit on a fixed range.
+    """App. D: the analytic grid must stay valid however far the biases spread.
 
-    Margins are `s - alpha` with `alpha` taken from the *biased* score, so they
-    translate by roughly `-b` as training proceeds. A fixed grid (the original
-    [-1, 1]) put 94% of margins in the edge bins once the biases spread, and the
-    estimate collapsed. The error must stay at bin-width scale in every regime,
-    independent of where the margins sit.
+    The binned quantity is the required bias `r = alpha - s`, which translates
+    with the bias as training proceeds. App. D bounds it by `[b_min-1, b_max+1]`
+    from the *current* bias, so the grid widens exactly as the biases do. A grid
+    fixed at [-1, 1] would put nearly every value in the edge bins once the
+    biases spread, and the estimate would collapse. The error must stay at
+    bin-width scale in every regime.
     """
     moe = StableLatentMoE(cfg, rngs=nnx.Rngs(0))
     x = jax.random.normal(jax.random.PRNGKey(3), (8, 64, cfg.hidden_size))
@@ -185,29 +225,40 @@ def test_histogram_quantile_tracks_the_exact_one_as_bias_drifts(cfg):
         _, stats = moe(x)
         exact = quantile_balancing_update(stats, cfg.num_experts_per_token)
         hist = quantile_balancing_update_histogram(stats, cfg.num_experts_per_token)
-        margins = stats.scores - stats.cutoff[:, None]
-        bin_width = float((margins.max(axis=0) - margins.min(axis=0)).max()) / 512
+        bin_width = (2 * spread + 2) / 1_000  # (b_max - b_min + 2) / num_bins
         assert float(jnp.abs(exact - hist).max()) < 10 * bin_width, f"spread={spread}"
 
 
-def test_histogram_quantile_accepts_an_agreed_grid(cfg):
-    """`value_range` is how ranks share one grid so their counts stay additive."""
+def test_histogram_grid_is_analytic_and_needs_no_extra_all_reduce(cfg):
+    """App. D derives the grid from the bias, which every rank already holds.
+
+    That is what keeps the count all-reduce the estimator's only communication:
+    passing the range explicitly must reproduce the automatic one exactly.
+    """
     moe = StableLatentMoE(cfg, rngs=nnx.Rngs(0))
-    x = jax.random.normal(jax.random.PRNGKey(3), (4, 32, cfg.hidden_size))
-    _, stats = moe(x)
-    margins = stats.scores - stats.cutoff[:, None]
+    moe.router_bias[...] = jnp.linspace(-2.0, 5.0, cfg.num_routed_experts)
+    _, stats = moe(jax.random.normal(jax.random.PRNGKey(3), (4, 32, cfg.hidden_size)))
 
     auto = quantile_balancing_update_histogram(stats, cfg.num_experts_per_token)
+    b = stats.bias
     supplied = quantile_balancing_update_histogram(
-        stats, cfg.num_experts_per_token, value_range=(margins.min(axis=0), margins.max(axis=0))
+        stats, cfg.num_experts_per_token, value_range=(b.min() - 1.0, b.max() + 1.0)
     )
     assert jnp.allclose(auto, supplied)  # same grid => identical answer
 
-    # A scalar range broadcasts across experts.
-    scalar = quantile_balancing_update_histogram(
-        stats, cfg.num_experts_per_token, value_range=(-5.0, 5.0)
+    # Every required bias must actually fall inside that analytic range, or the
+    # clamp into the end bins would silently bias the estimate.
+    r = stats.cutoff[:, None] - stats.scores
+    assert float(r.min()) >= float(b.min() - 1.0)
+    assert float(r.max()) <= float(b.max() + 1.0)
+
+    # A per-expert range still broadcasts, for callers with a tighter bound.
+    per_expert = quantile_balancing_update_histogram(
+        stats,
+        cfg.num_experts_per_token,
+        value_range=(r.min(axis=0), r.max(axis=0)),
     )
-    assert scalar.shape == (cfg.num_routed_experts,)
+    assert per_expert.shape == (cfg.num_routed_experts,)
 
 
 def test_quantile_balancing_bias_is_zero_mean(cfg):
@@ -269,11 +320,19 @@ def test_model_forward_and_gradients(cfg):
     flat = jax.tree_util.tree_flatten_with_path(grads)[0]
     assert flat and all(jnp.isfinite(g).all() for _, g in flat)
 
-    # Every parameter should receive gradient except the two documented in
-    # `test_layer_zero_pseudo_queries_are_inert` below.
-    dead = [jax.tree_util.keystr(p) for p, g in flat if float(jnp.abs(g).sum()) == 0]
-    assert all("['layers'][0]" in name and "_query" in name for name in dead), dead
-    assert len(dead) == 2
+    # Every parameter should receive gradient except three, each for a reason
+    # that follows from the paper rather than from a bug:
+    #   * layer 0's two pseudo-queries — see the test below;
+    #   * W_E3, which §4.1.4 introduces at draft fine-tuning time, "with the
+    #     target model frozen and only the draft layer and its feature-fusion
+    #     projection updated". The pre-training objective never routes through
+    #     it, so it correctly sits at its [0 0 I] initialisation.
+    dead = {jax.tree_util.keystr(p) for p, g in flat if float(jnp.abs(g).sum()) == 0}
+    assert dead == {
+        "['layers'][0]['attn_query']['w'].value",
+        "['layers'][0]['ffn_query']['w'].value",
+        "['e3_fusion']['w'].value",
+    }, dead
 
 
 def test_layer_zero_pseudo_queries_are_inert():
@@ -336,6 +395,47 @@ def test_vision_splice_replaces_placeholder_tokens(cfg):
     assert not jnp.allclose(spliced[:, 2:4], text_only[:, 2:4])
 
 
+def test_vision_tower_size_matches_table_1():
+    """[Table 1] "Total Parameters of ViT 401M", at 27 layers / patch 14 / 12 heads.
+
+    The inferred widths only reproduce that if the spatial and temporal passes
+    share one attention module. With separate projections the tower is 555M,
+    38% over — which is what this guards.
+    """
+    cfg = k3.KimiK3Config()
+    enc = nnx.eval_shape(lambda: k3.MoonViTV2(cfg, rngs=nnx.Rngs(0)))
+    n = sum(p.size for p in jax.tree.leaves(nnx.state(enc, nnx.Param)))
+    assert 0.39e9 < n < 0.42e9, f"MoonViT-V2 is {n / 1e6:.0f}M, Table 1 says 401M"
+
+
+def test_eagle3_fusion_starts_as_the_high_level_feature(cfg):
+    """§4.1.4: W_E3 = [0 0 I], so at init the fused input is the high feature.
+
+    Also pins the indexing: `blocks[0]` is the embedding b_0, so the "1st, 4th
+    and final AttnRes blocks" are indices 1, 4 and N — not 0, 3 and N-1.
+    """
+    model = k3.KimiK3(cfg, rngs=nnx.Rngs(0), with_vision=False)
+    ids = jax.random.randint(jax.random.PRNGKey(1), (2, 12), 0, cfg.vocab_size)
+    blocks = model(ids)["blocks"]
+
+    low, mid, high = cfg.eagle3_block_indices
+    assert low == 1 and high == cfg.num_attn_res_blocks
+    assert high == blocks.shape[0] - 1  # in range: sources are blocks + embedding
+
+    fused = model.draft_input(blocks)
+    assert fused.shape == blocks[high].shape
+    assert jnp.allclose(fused, blocks[high], atol=1e-5)
+
+    # Once W_E3 moves off [0 0 I] the shallower features do come in.
+    model.e3_fusion.w[...] = model.e3_fusion.w[...].at[0, 0].set(1.0)
+    assert not jnp.allclose(model.draft_input(blocks), blocks[high], atol=1e-5)
+
+
+def test_real_config_eagle3_indices_are_the_paper_s():
+    """1st, 4th and final of 8 blocks, over a `blocks` array that leads with b_0."""
+    assert k3.KimiK3Config().eagle3_block_indices == (1, 4, 8)
+
+
 def test_newton_schulz_orthogonalises():
     m = jax.random.normal(jax.random.PRNGKey(0), (32, 64))
     sv = jnp.linalg.svd(k3.newton_schulz(m), compute_uv=False)
@@ -360,6 +460,93 @@ def test_per_head_orthogonalisation_is_independent_per_head():
     whole = orthogonalize(m, 0).reshape(32, 4, 8)
     whole_norms = jnp.linalg.norm(whole, axis=(0, 2))
     assert float(whole_norms.max() / whole_norms.min()) > 2.0  # still dominated
+
+
+def test_muon_covers_matrices_and_only_matrices(cfg):
+    """§2.5: Muon takes the model's matrix parameters — decided by role, not rank.
+
+    Three regressions this pins down, all from labelling on `ndim == 2`:
+      * the embedding table and the LM head are 2-D but are lookups, and the
+        standard Muon recipe keeps them on AdamW;
+      * `RMSNormGated.scale`, KDA's `alpha_bias` and ShortConv's depthwise taps
+        are 2-D but are gains/biases with no spectrum to orthogonalise;
+      * the routed-expert banks are 3-D stacks of real matrices, and at K3's
+        scale they are 2.72T of 2.78T parameters — labelling them by rank sent
+        essentially the whole model to AdamW.
+    """
+    model = k3.KimiK3(cfg, rngs=nnx.Rngs(0), with_vision=True)
+    _, params, _ = nnx.split(model, nnx.Param, ...)
+    labels = muon_label_tree(params)
+    flat = {
+        jax.tree_util.keystr(p): lbl for p, lbl in jax.tree_util.tree_flatten_with_path(labels)[0]
+    }
+
+    def branch(fragment):
+        hits = {v for k, v in flat.items() if fragment in k}
+        assert hits, f"no parameter matching {fragment!r}"
+        assert len(hits) == 1, f"{fragment!r} split across branches: {hits}"
+        return hits.pop()
+
+    assert branch("['embed']['embedding']") == "adam"
+    assert branch("['lm_head']") == "adam"
+    assert branch("['o_norm']['scale']") == "adam"
+    assert branch("['alpha_bias']") == "adam"
+    assert branch("['q_conv']['weight']") == "adam"  # depthwise taps
+    assert branch("['patch_embed']") == "adam"  # 4-D input embedding
+
+    assert branch("['q_proj']['kernel']") == "muon"
+    assert branch("['experts']['w_gate']") == "muon"
+    assert branch("['experts']['w_down']") == "muon"
+
+    # And the expert banks must dominate the Muon branch, as they do in the
+    # real model — this is the whole point of not labelling by rank.
+    sizes = {k: v.size for k, v in jax.tree_util.tree_flatten_with_path(params)[0]}
+    sizes = {jax.tree_util.keystr(k): v for k, v in jax.tree_util.tree_flatten_with_path(params)[0]}
+    muon_total = sum(p.size for k, p in sizes.items() if flat[k] == "muon")
+    expert_total = sum(p.size for k, p in sizes.items() if "['experts']" in k)
+    assert expert_total > 0.5 * muon_total
+
+
+def test_muon_orthogonalises_each_expert_independently():
+    """A stacked bank is E separate matrices, not one coupled block.
+
+    Same argument §2.5 makes for heads: without the split, an expert with a
+    large momentum scale would dominate the whole bank's update direction.
+    """
+    m = jax.random.normal(jax.random.PRNGKey(0), (4, 16, 16))
+    m = m.at[0].multiply(1000.0)  # expert 0 dominates
+    banked = orthogonalize(m, 0)
+    norms = jnp.linalg.norm(banked, axis=(1, 2))
+    assert float(norms.max() / norms.min()) < 1.5  # scales equalised
+
+    # Each slice must equal orthogonalising that slice on its own.
+    for i in range(4):
+        assert jnp.allclose(banked[i], orthogonalize(m[i], 0), atol=1e-5)
+
+
+def test_expert_banks_actually_move_under_the_optimizer(cfg):
+    """The regression that mattered: expert weights silently bypassing Muon."""
+    import optax
+
+    model = k3.KimiK3(cfg, rngs=nnx.Rngs(0), with_vision=False)
+    ids = jax.random.randint(jax.random.PRNGKey(1), (2, 16), 0, cfg.vocab_size)
+    gdef, params, rest = nnx.split(model, nnx.Param, ...)
+    tx = k3.kimi_k3_optimizer(1e-3, cfg.num_heads, params)
+    state = tx.init(params)
+
+    def loss(p):
+        return k3.causal_lm_loss(nnx.merge(gdef, p, rest)(ids)["logits"], ids)
+
+    updates, _ = tx.update(jax.grad(loss)(params), state, params)
+    flat = {jax.tree_util.keystr(k): v for k, v in jax.tree_util.tree_flatten_with_path(updates)[0]}
+    banks = {k: v for k, v in flat.items() if "['experts']" in k}
+    assert banks
+    assert all(float(jnp.abs(v).max()) > 0 for v in banks.values())
+    # A Muon update is orthogonalised then rescaled, so its entries are all of
+    # comparable size — unlike a raw gradient, which is dominated by a few.
+    for k, v in banks.items():
+        rms = float(jnp.sqrt(jnp.mean(v**2)))
+        assert float(jnp.abs(v).max()) < 25 * rms, k
 
 
 def test_optimizer_step_runs(cfg):

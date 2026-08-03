@@ -10,7 +10,7 @@ paper does it that way. The defaults in `config.py` are the real 2.8T model;
 
 ```bash
 python demo.py                    # guided tour of every component
-python -m pytest tests/ -q        # 30 tests
+python -m pytest tests/ -q        # 42 tests
 python -m kimi_k3.config          # parameter-count check against Table 1
 ```
 
@@ -86,8 +86,19 @@ not restated by the K3 report, is also absent.
 Correctness is checked rather than assumed: the chunkwise KDA form is tested
 against the token-by-token recurrence it is derived from, both attention layers'
 streaming decode paths are tested against their full forward pass, SiTU-GLU is
-tested against its stated bound, and QB is tested to actually reduce load
-imbalance.
+tested against its stated bound, QB is tested to actually reduce load imbalance,
+the histogram estimator is tested against the exact quantile as the biases
+spread, and both parameter counts (backbone and vision tower) are tested against
+Table 1.
+
+Two limits are worth knowing about because they are load-bearing rather than
+incidental. KDA's `chunk_size` is fixed by the decay floor, not free: the
+intra-chunk term carries `e^{-g_min·C}`, which is `e^80` at C = 16 and overflows
+at C = 32, so `kda_chunkwise` refuses anything wider. And Muon's parameter split
+is decided by role, not by tensor rank — the routed-expert banks are 3-D stacks
+of real matrices and carry 2.72T of the 2.78T, while several 2-D parameters
+(norm gains, per-head biases, depthwise conv taps, the embedding table) are not
+matrices at all. `muon_label_tree` documents the split and a test pins it.
 
 ## A note on unstated hyper-parameters
 
@@ -97,6 +108,17 @@ the per-head sizes or the MLA latent ranks. Those counts pin them down:
 `kv_lora_rank = 512`, and shared experts at the routed experts' hidden width
 reproduce **2.78T total and 103.5B activated**. Every such value is marked
 `[inferred]` in `config.py`, and `python -m kimi_k3.config` prints the arithmetic.
+
+The vision tower is pinned the same way, and the inference is worth stating
+because it is structural rather than just a width. Table 1 gives 27 layers,
+patch 14, 12 heads and 401M parameters. §2.4 factorises attention into a spatial
+and a temporal pass; if those hold separate projections, no width with an
+integral head dim lands near 401M. If they share one attention module, the
+SigLIP-So400M shape (1152 wide, 4304 MLP, head dim 96) gives 411M. So this
+implementation shares them — which is also what makes §2.4's "images and videos
+are processed with fully shared parameters" hold literally, an image being the
+F = 1 case where the temporal pass drops out. `test_vision_tower_size_matches_table_1`
+holds the count.
 
 ## Requirements
 
