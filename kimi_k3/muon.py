@@ -69,8 +69,18 @@ def orthogonalize(m: jax.Array, num_heads: int = 0) -> jax.Array:
     projection's out_features is `num_heads * head_dim`. So the head partition is
     a split of the OUTPUT axis: [d_in, H*Dh] -> [H, d_in, Dh], one matrix per
     head, orthogonalised independently by vmap.
+
+    A 3-D input is a STACKED BANK of independent matrices — the MoE expert
+    weights are held as [num_experts, d_in, d_out] so the whole bank is one
+    `ragged_dot` (see `moe.RoutedExperts`). Each expert is its own matrix, so the
+    bank is orthogonalised slice by slice, never as one coupled block. This is
+    the same argument §2.5 makes for splitting attention projections per head.
     """
-    if not num_heads or m.ndim != 2:
+    if m.ndim == 3:
+        return jax.vmap(lambda x: orthogonalize(x, num_heads))(m)
+    if m.ndim != 2:
+        return m
+    if not num_heads:
         return newton_schulz(m)
     d_in, d_out = m.shape
     per_head = m.reshape(d_in, num_heads, d_out // num_heads).transpose(1, 0, 2)
@@ -126,11 +136,13 @@ def per_head_muon(
         raw = jax.tree.map(lambda m, g: g + momentum * m, buf, grads) if nesterov else buf
 
         def step(u, h):
-            if u.ndim != 2:  # 1-D parameters are not Muon's business
+            if u.ndim < 2:  # 1-D parameters are not Muon's business
                 return u  # passed through in gradient direction, as below
             o = orthogonalize(u.astype(F32), int(h))
+            # The RMS scaling is per MATRIX, so a stacked expert bank is scaled by
+            # its expert shape (u.shape[-2:]) and not by the number of experts.
             # Gradient direction, NOT descent — see "SIGN CONVENTION" above.
-            return 0.2 * (max(u.shape) ** 0.5) * o
+            return 0.2 * (max(u.shape[-2:]) ** 0.5) * o
 
         updates = jax.tree.map(step, raw, heads)
         return updates, MuonState(buf)
@@ -143,6 +155,51 @@ def per_head_muon(
 # ---------------------------------------------------------------------------
 
 _ATTENTION_PROJECTIONS = ("q_proj", "k_proj", "v_proj", "q_up", "kv_up")
+
+# Parameters that happen to be 2-D but are NOT linear maps. Muon orthogonalises
+# the update's singular-value spectrum; a gain vector, a bias or a stack of
+# depthwise conv taps has no such spectrum to equalise, so these go to AdamW
+# alongside the genuinely 1-D parameters.
+_ADAM_LEAVES = (
+    "embedding",  # nnx.Embed table [vocab, d]: a lookup, not a linear map
+    "scale",  # nnx.RMSNorm and RMSNormGated gains (the latter is [H, Dh])
+    "bias",  # ShortConv bias, and any Linear bias
+    "alpha_bias",  # KDA Eq. 2 per-head decay bias, [H, Dh]
+    "log_scale",  # KDA Eq. 5 per-head A_h
+    "weight",  # ShortConv depthwise taps [kernel_size, features]
+)
+# Modules excluded wholesale. The LM head is the output embedding; the standard
+# Muon recipe (Moonlight / K2, which K3 follows) keeps both embeddings on AdamW.
+_ADAM_MODULES = ("lm_head",)
+
+
+def muon_label_tree(params):
+    """Split the parameters between the Muon and the AdamW branch, BY ROLE.
+
+    §2.5 applies Muon to the model's *matrix* parameters. Tensor rank alone does
+    not identify those, in either direction:
+
+      * 2-D but not a matrix — `RMSNormGated.scale` and KDA's `alpha_bias` are
+        both [num_heads, head_dim]; the embedding table is [vocab, d].
+      * 3-D but very much a matrix — the routed experts are stored as one
+        [num_experts, d_in, d_out] bank per weight (`moe.RoutedExperts`), which
+        at K3's scale is 2.72T of the model's 2.78T parameters. Labelling those
+        by rank would hand almost the entire model to AdamW.
+
+    `orthogonalize` handles the bank by orthogonalising each expert separately.
+    """
+
+    def label(path, leaf):
+        keys = [str(getattr(p, "key", p)) for p in path]
+        if any(m in keys for m in _ADAM_MODULES):
+            return "adam"
+        if any(name in keys for name in _ADAM_LEAVES):
+            return "adam"
+        # 4-D stays on AdamW: the only one is MoonViT's patchify conv, which is
+        # an input embedding in the same sense as the token table.
+        return "muon" if leaf.ndim in (2, 3) else "adam"
+
+    return jax.tree_util.tree_map_with_path(label, params)
 
 
 def head_partition_tree(params, num_heads: int):
@@ -175,15 +232,16 @@ def kimi_k3_optimizer(
     """Per-Head Muon on matrices, AdamW on everything else.
 
     Muon is only defined for matrices. Embeddings, the LM head, norm scales and
-    biases (all 1-D, or better treated as a lookup than a linear map) go to
-    AdamW, which is the standard Muon recipe and the one K2/K3 follow.
+    biases go to AdamW, which is the standard Muon recipe and the one K2/K3
+    follow; the routed-expert banks go to Muon, per expert. `muon_label_tree`
+    documents how the split is decided.
 
     Weight decay is 0.1 throughout, per §3.3. The report also specifies a cosine
     schedule with a 1% linear warmup — pass that in as `learning_rate` (see
     `cosine_schedule_with_warmup`); the scaling-law study in §3.2 found cosine
     beat WSD once each schedule got its own hyper-parameter search.
     """
-    labels = jax.tree.map(lambda p: "muon" if p.ndim == 2 else "adam", params)
+    labels = muon_label_tree(params)
     # `multi_transform` hands each branch the parameter tree with the *other*
     # branch's leaves replaced by `MaskedNode()`. The head-partition tree travels
     # alongside the gradients inside the Muon branch, so it has to be masked the

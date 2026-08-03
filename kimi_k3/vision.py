@@ -28,7 +28,9 @@ WHAT §2.4 SPECIFIES
   * A lightweight MLP projector maps the result into the LLM embedding space.
 
 Widths (1152 hidden, 4304 MLP) are not stated in the report; they are the
-SigLIP-So400M shape, which is what reproduces "27 layers / 401M / patch 14".
+SigLIP-So400M shape, which together with sharing one attention module between
+the spatial and temporal passes (see `MoonViTBlock`) reproduces Table 1's
+"27 layers / 401M / patch 14" to 411M.
 
 NOT MODELLED HERE: native-resolution sequence packing (real MoonViT packs
 variable-sized images into one batch with block-diagonal attention). This file
@@ -100,14 +102,23 @@ class MoonViTBlock(nnx.Module):
         - temporal: attend across the F frames, at each spatial location,
     for O(F*(hw)^2 + hw*F^2). An image is simply the F=1 case, where the temporal
     pass is a no-op — same parameters, no special-casing.
+
+    THE TWO PASSES SHARE ONE ATTENTION MODULE.  [inferred] The report gives the
+    tower's size (401M) and shape (27 layers, patch 14, 12 heads) but not its
+    width, and the two are not independent. With separate spatial and temporal
+    projections, no width with an integral head_dim lands near 401M; with the
+    projections shared, 27 layers at the SigLIP-So400M shape (1152 wide, 4304
+    MLP, head_dim 96) gives 411M — the only clean solution to the constraint.
+    Sharing is also what makes the "an image is just F=1, same parameters"
+    property above literally true rather than only nearly true. The two passes
+    keep separate pre-norms, which cost 1152 parameters each.
     """
 
     def __init__(self, cfg: KimiK3Config, *, rngs: nnx.Rngs):
         d, eps = cfg.vision_hidden, cfg.rms_norm_eps
         self.norm_spatial = nnx.RMSNorm(d, epsilon=eps, use_scale=True, rngs=rngs)
-        self.spatial = VisionAttention(d, cfg.vision_heads, rngs=rngs)
         self.norm_temporal = nnx.RMSNorm(d, epsilon=eps, use_scale=True, rngs=rngs)
-        self.temporal = VisionAttention(d, cfg.vision_heads, rngs=rngs)
+        self.attn = VisionAttention(d, cfg.vision_heads, rngs=rngs)
         self.norm_mlp = nnx.RMSNorm(d, epsilon=eps, use_scale=True, rngs=rngs)
         self.fc1 = nnx.Linear(d, cfg.vision_mlp_hidden, use_bias=False, rngs=rngs)
         self.fc2 = nnx.Linear(cfg.vision_mlp_hidden, d, use_bias=False, rngs=rngs)
@@ -118,14 +129,16 @@ class MoonViTBlock(nnx.Module):
         hw = grid[0] * grid[1]
 
         # --- spatial: [B, F*hw, d] -> [B*F, hw, d], attend, and fold back.
+        # `grid` is supplied, so this pass gets the 2-D RoPE.
         s = self.norm_spatial(x).reshape(B * frames, hw, d)
-        x = x + self.spatial(s, grid=grid).reshape(B, N, d)
+        x = x + self.attn(s, grid=grid).reshape(B, N, d)
 
-        # --- temporal: regroup so the sequence axis is the frame axis.
+        # --- temporal: regroup so the sequence axis is the frame axis. Same
+        # projections, no grid: position along time is not spatial.
         if frames > 1:
             t = self.norm_temporal(x).reshape(B, frames, hw, d)
             t = t.transpose(0, 2, 1, 3).reshape(B * hw, frames, d)
-            t = self.temporal(t).reshape(B, hw, frames, d).transpose(0, 2, 1, 3)
+            t = self.attn(t).reshape(B, hw, frames, d).transpose(0, 2, 1, 3)
             x = x + t.reshape(B, N, d)
 
         return x + self.fc2(jax.nn.gelu(self.fc1(self.norm_mlp(x))))

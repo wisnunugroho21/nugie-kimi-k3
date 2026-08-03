@@ -58,6 +58,11 @@ from flax import nnx
 from .config import KimiK3Config
 from .layers import F32, RMSNormGated, ShortConv, l2_norm, swish
 
+# The widest cumulative log-decay range the chunkwise form can carry; see the
+# NUMERICS note in `kda_chunkwise`. With the report's g_min = -5 this is what
+# pins the tile size at 16.
+_MAX_LOG_RANGE = 80.0
+
 # ===========================================================================
 # The recurrence, two ways
 # ===========================================================================
@@ -108,6 +113,7 @@ def kda_chunkwise(
     beta: jax.Array,  # [B, H, T]
     state: jax.Array | None = None,  # [B, H, Dk, Dv]
     chunk_size: int = 16,
+    g_min: float = -5.0,
 ) -> tuple[jax.Array, jax.Array]:
     """Eqs. 3-4: recurrent across chunks, parallel (matmuls) inside a chunk.
 
@@ -145,17 +151,34 @@ def kda_chunkwise(
     exact bottleneck §2.1.1 describes. K3 bounds the per-step log-decay below by
     g_min = -5, so over a 16-token chunk the cumulative log-decay lies in
     (-80, 0) and 1/Gamma <= e^80, comfortably inside the BF16/FP32 exponent
-    range. That is why `chunk_size` defaults to 16, and why K3 can run *every*
-    tile — diagonal included — as a dense matmul, where Kimi Linear needed an
-    explicit position-pair computation on the diagonal tiles.
+    range. That is why K3 tiles at 16, and why it can run *every* tile —
+    diagonal included — as a dense matmul, where Kimi Linear needed an explicit
+    position-pair computation on the diagonal tiles.
 
-    (A production kernel uses a larger primary chunk subdivided into 16-token
-    secondary tiles, and can also center the exponents by G_C/2 to double the
-    safe range. Both are optimisations of exactly this algebra.)
+    `chunk_size` IS A HARD NUMERICAL LIMIT, NOT A FREE KNOB.  `A` is formed as a
+    full `(Q*Gamma)(K/Gamma)^T` and only then masked, so its strictly-upper
+    triangle transiently holds ratios up to `e^{-g_min * C}`. At C = 16 and
+    g_min = -5 that is e^80, just inside the ~e^88 fp32/bf16 ceiling; at C = 32
+    it is e^160 and every output is NaN. The assertion below enforces the bound
+    rather than letting it fail silently on a workload whose decay happens to
+    sit near the floor. To go wider you need the production kernel's structure:
+    a larger primary chunk subdivided into 16-token secondary tiles, optionally
+    centering the exponents by G_C/2 to double the safe range. Both are
+    optimisations of exactly this algebra, not changes to it.
     """
     B, H, T, Dk = q.shape
     Dv = v.shape[-1]
     C = chunk_size
+
+    # e^88 overflows fp32; e^80 is the largest reciprocal rescaling that leaves
+    # room for the head-dim sum in the einsum that consumes it.
+    if -g_min * C > _MAX_LOG_RANGE:
+        raise ValueError(
+            f"chunk_size={C} with g_min={g_min} lets the reciprocal decay reach "
+            f"e^{-g_min * C:.0f}, past the e^{_MAX_LOG_RANGE:.0f} that fp32/bf16 can "
+            f"hold; the intra-chunk term would overflow to NaN whenever the decay "
+            f"sits near its Eq. 5 floor. Use chunk_size <= {int(_MAX_LOG_RANGE / -g_min)}."
+        )
 
     # Pad the sequence to a whole number of chunks. Padding tokens are made
     # inert: alpha=1 (no decay), beta=0 (no write), q=k=v=0 (no read/write).
@@ -303,13 +326,22 @@ class KimiDeltaAttention(nnx.Module):
         g = self.cfg.kda_g_min * jax.nn.sigmoid(scale * z.astype(F32))
         return jnp.exp(g)  # alpha
 
-    def _inputs(self, x: jax.Array, cache: KDACache | None):
-        """Eq. 2: project -> ShortConv -> Swish -> (L2Norm for q, k)."""
+    def _inputs(self, x: jax.Array, cache: KDACache | None, mask: jax.Array | None = None):
+        """Eq. 2: project -> ShortConv -> Swish -> (L2Norm for q, k).
+
+        `mask` is an optional [B, T] boolean of valid positions. A padded token
+        must not touch the recurrent state, so it is made inert exactly the way
+        `kda_chunkwise` makes its own padding inert: beta = 0 (no write) and
+        alpha = 1 (no decay). Its q/k/v are also zeroed before the ShortConv, so
+        padding cannot leak into a valid token's local window either. Outputs at
+        padded positions are meaningless, as they are for MLA.
+        """
         B, T, _ = x.shape
+        xm = x if mask is None else jnp.where(mask[..., None], x, 0.0)
         cq, ck, cv = (cache.conv_q, cache.conv_k, cache.conv_v) if cache else (None, None, None)
-        q, cq = self.q_conv(self.q_proj(x), cq)
-        k, ck = self.k_conv(self.k_proj(x), ck)
-        v, cv = self.v_conv(self.v_proj(x), cv)
+        q, cq = self.q_conv(self.q_proj(xm), cq)
+        k, ck = self.k_conv(self.k_proj(xm), ck)
+        v, cv = self.v_conv(self.v_proj(xm), cv)
 
         split = lambda t: t.reshape(B, T, self.H, self.Dh).transpose(0, 2, 1, 3)  # [B,H,T,Dh]
         q = l2_norm(split(swish(q)))
@@ -317,6 +349,10 @@ class KimiDeltaAttention(nnx.Module):
         v = split(swish(v))  # v is NOT L2-normalised: it carries magnitude
         beta = jax.nn.sigmoid(self.beta_proj(x)).transpose(0, 2, 1)  # [B,H,T]
         alpha = self._decay(x).transpose(0, 2, 1, 3)  # [B,H,T,Dh]
+        if mask is not None:
+            valid = mask[:, None, :]  # [B, 1, T]
+            beta = jnp.where(valid, beta, 0.0)
+            alpha = jnp.where(valid[..., None], alpha, 1.0)
         return q, k, v, alpha, beta, (cq, ck, cv)
 
     def _output(self, o: jax.Array, x: jax.Array) -> jax.Array:
@@ -327,11 +363,21 @@ class KimiDeltaAttention(nnx.Module):
         return self.out_proj((gate * o).reshape(B, T, self.H * self.Dh))
 
     # ------------------------------------------------------------------
-    def __call__(self, x: jax.Array, *, use_chunkwise: bool = True) -> jax.Array:
-        """Training / prefill forward pass. x: [B, T, d] -> [B, T, d]."""
-        q, k, v, alpha, beta, _ = self._inputs(x, None)
+    def __call__(
+        self, x: jax.Array, mask: jax.Array | None = None, *, use_chunkwise: bool = True
+    ) -> jax.Array:
+        """Training / prefill forward pass. x: [B, T, d] -> [B, T, d].
+
+        `mask` is an optional [B, T] boolean of valid positions; see `_inputs`.
+        Causality is intrinsic to the recurrence and needs no mask.
+        """
+        q, k, v, alpha, beta, _ = self._inputs(x, None, mask)
         core = kda_chunkwise if use_chunkwise else kda_recurrent
-        kwargs = {"chunk_size": self.cfg.kda_chunk_size} if use_chunkwise else {}
+        kwargs = (
+            {"chunk_size": self.cfg.kda_chunk_size, "g_min": self.cfg.kda_g_min}
+            if use_chunkwise
+            else {}
+        )
         o, _ = core(q, k, v, alpha, beta, None, **kwargs)
         return self._output(o, x)
 

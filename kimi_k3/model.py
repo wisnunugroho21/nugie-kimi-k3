@@ -83,8 +83,10 @@ class DecoderLayer(nnx.Module):
 
         Returns `f_i(h_i)`, the layer's contribution to its block's sum.
         """
+        # Both mixers take `mask` — MLA masks the attention logits, KDA keeps
+        # padded tokens out of the recurrent state (see `KimiDeltaAttention`).
         a_in = self.attn_norm(self.attn_query(values))
-        attn_out = self.attn(a_in, mask) if self.is_mla else self.attn(a_in)
+        attn_out = self.attn(a_in, mask)
 
         f_in = self.ffn_norm(self.ffn_query(values))
         if self.is_dense:
@@ -143,6 +145,10 @@ class Eagle3Fusion(nnx.Module):
     pre-trained on — so fine-tuning starts from the pre-trained behaviour and
     *learns* to bring in the shallower features rather than being perturbed by
     them from the outset.
+
+    Wired up by `KimiK3.draft_input`, which picks the three blocks by
+    `cfg.eagle3_block_indices` — the indexing is easy to get wrong by one,
+    because slot 0 of the `blocks` array is the embedding, not the first block.
     """
 
     def __init__(self, cfg: KimiK3Config, *, rngs: nnx.Rngs):
@@ -171,6 +177,9 @@ class KimiK3(nnx.Module):
         self.lm_head = nnx.Linear(d, cfg.vocab_size, use_bias=False, rngs=rngs)
 
         self.mtp = MTPLayer(cfg, rngs=rngs) if cfg.num_mtp_layers else None
+        # §4.1.4: the MTP layer is what gets fine-tuned into the EAGLE-3 draft
+        # model, so its feature-fusion projection lives beside it.
+        self.e3_fusion = Eagle3Fusion(cfg, rngs=rngs) if cfg.num_mtp_layers else None
         self.vision = VisionTower(cfg, rngs=rngs) if with_vision else None
 
     # ------------------------------------------------------------------
@@ -219,6 +228,23 @@ class KimiK3(nnx.Module):
         blocks = jnp.stack(stream.sources, axis=0)  # [N+1, B, T, d]
         hidden = self.final_norm(self.output_query(blocks))
         return hidden, blocks, stats
+
+    def draft_input(self, blocks: jax.Array) -> jax.Array:
+        """§4.1.4: the EAGLE-3 draft model's fused input. blocks -> [B, T, d].
+
+        Takes the `blocks` array returned by `__call__` and fuses the low-, mid-
+        and high-level features — the 1st, 4th and final AttnRes block outputs,
+        per `cfg.eagle3_block_indices`. At initialisation `W_E3 = [0 0 I]`, so
+        this returns the high-level feature unchanged, which is exactly the
+        input the MTP layer was pre-trained on.
+
+        Draft fine-tuning itself (target frozen, seven-step unroll, the LK loss
+        of Eq. 16) is post-training and out of scope here; this is the
+        architectural piece it needs.
+        """
+        assert self.e3_fusion is not None, "no MTP layer, so no draft model"
+        low, mid, high = self.cfg.eagle3_block_indices
+        return self.e3_fusion(blocks[low], blocks[mid], blocks[high])
 
     def __call__(
         self,
@@ -269,11 +295,19 @@ def causal_lm_loss(
     return (nll * m).sum() / jnp.clip(m.sum(), 1.0)
 
 
-def mtp_loss(mtp_logits: jax.Array, labels: jax.Array) -> jax.Array:
+def mtp_loss(
+    mtp_logits: jax.Array,
+    labels: jax.Array,
+    mask: jax.Array | None = None,
+) -> jax.Array:
     """The MTP objective: `mtp_logits[:, t]` predicts `labels[:, t+2]`."""
     logits, targets = mtp_logits[:, :-2], labels[:, 2:]
     ll = jnp.take_along_axis(jax.nn.log_softmax(logits.astype(F32), -1), targets[..., None], -1)
-    return -ll[..., 0].mean()
+    nll = -ll[..., 0]
+    if mask is None:
+        return nll.mean()
+    m = mask[:, 2:].astype(F32)
+    return (nll * m).sum() / jnp.clip(m.sum(), 1.0)
 
 
 def apply_quantile_balancing(model: KimiK3, stats: list[RouterStats]) -> None:

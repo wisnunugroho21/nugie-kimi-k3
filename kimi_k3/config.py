@@ -90,7 +90,11 @@ class KimiK3Config:
 
     # ------------------------------------------------------ §2.4 Native Vision
     vision_layers: int = 27  # [Table 1] "#ViT Layers 27"
-    vision_hidden: int = 1_152  # [inferred] SigLIP-So400M width; gives ~411M
+    # [inferred] SigLIP-So400M shape. With the spatial and temporal passes
+    # sharing one attention module (see vision.MoonViTBlock) this gives 411M
+    # against Table 1's "Total Parameters of ViT 401M" — the closest fit with an
+    # integral head_dim (1152/12 = 96). Checked by test_vision_tower_size.
+    vision_hidden: int = 1_152
     vision_mlp_hidden: int = 4_304  # [inferred] same lineage
     vision_heads: int = 12  # [Table 1] "#Attention Heads of ViT 12"
     vision_patch_size: int = 14  # [Table 1] "Patch Size of ViT 14"
@@ -112,6 +116,19 @@ class KimiK3Config:
     def is_dense_layer(self, layer_idx: int) -> bool:
         """[Table 1] the first `num_dense_layers` layers skip the MoE."""
         return layer_idx < self.num_dense_layers
+
+    @property
+    def eagle3_block_indices(self) -> tuple[int, int, int]:
+        """§4.1.4: the low-, mid- and high-level features the draft model fuses.
+
+        "taken from the outputs of the 1st, 4th, and final AttnRes blocks". These
+        index `KimiK3.__call__`'s `blocks` array, whose slot 0 is the embedding
+        b_0 — so the 1st block is index 1, not 0. For the real model that is
+        (1, 4, 8); the middle index is clamped so configs with fewer than 4
+        blocks (e.g. `tiny`) stay in range.
+        """
+        n = self.num_attn_res_blocks
+        return 1, min(4, n), n
 
     # ------------------------------------------------------------- factories
     @classmethod
