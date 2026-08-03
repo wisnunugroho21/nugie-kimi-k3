@@ -1,124 +1,104 @@
-# Kimi K3 recreation — a hybrid linear-attention code LM in JAX
+# Kimi K3 in JAX / Flax NNX
 
-A from-scratch recreation of the **Kimi K3** architecture (Moonshot AI, July 2026)
-in JAX / Flax NNX, trained as a code-autocomplete LM on CodeParrot. K3's backbone
-is the hybrid linear-attention transformer of *Kimi Linear*, extended with
-depth-wise attention residuals, gated MLA, and a latent-space MoE; until the K3
-technical report lands, each feature here is implemented from its best public
-source (annotated throughout the code).
+A readable, tested implementation of the architecture in
+**"Kimi K3: Open Frontier Intelligence"** (Kimi Team, [arXiv:2607.24653](https://arxiv.org/abs/2607.24653)).
 
-> ⚠️ **Work in Progress**: This project is under active development. Expect significant changes, incomplete features, and frequent updates.
-
-## Architecture
-
-Decoder-only LM: `Embed → [DecoderLayer] × n_layers → RMSNorm → LM head`, where
-3 of every 4 layers use a linear-attention token mixer and the 4th uses full
-softmax attention (Kimi Linear's 3:1 hybrid), all threaded through a
-depth-attention residual backbone.
-
-| Feature | Paper | Where | Notes |
-| --- | --- | --- | --- |
-| **Block Attention Residuals** | arXiv:2603.15031 | `kimi_k3_gdn2.py` | Softmax attention over *depth*: each sub-layer's input is a learned mixture of the embedding, completed block sums, and the current partial sum. `attn_res: false` restores the plain pre-norm residual stream. |
-| **Gated DeltaNet-2** | arXiv:2605.22791 | `gated_deltanet_2/` | The linear-attention mixer (¾ of layers). Deliberate stand-in for K3's Kimi Delta Attention — same gated-delta-rule family, but with decoupled erase (`b`) and write (`w`) gates. Five interchangeable chunkwise cores with different numerics/perf trade-offs (`gdn_core:` faithful / stacked_rhs / centered / subchunking / pairwise). |
-| **Gated NoPE MLA** | arXiv:2505.06708 (gate) | `multi_latent_attention/attention.py` | The full-attention mixer (¼ of layers), in absorbed form — one latent serves as both K and V, so the decode cache stores only latents. No positional encoding (the recurrent layers carry position). Head-wise sigmoid output gate (K3's "Gated MLA"). |
-| **LatentMoE** | arXiv:2601.18089 | `multi_latent_attention/latent_moe.py` | Every layer's channel mixer: routed experts run in a shared low-rank latent (α = d_model/d_latent = 4 in the configs), with a full-width shared expert, sigmoid routing, group-limited routing, and DeepSeek-V3 aux-loss-free bias balancing plus a small sequence-level balancing loss. |
-| **Muon + AdamW** | arXiv:2502.16982 (Moonlight) | `pipeline/optimizer.py` | Hidden weight matrices → Muon (with consistent-RMS scaling, so AdamW's LR works unchanged); embedding, LM head, biases, norms, and decay parameters → AdamW. |
-
-Not yet recreated (awaiting the K3 technical report): the "Stable" LatentMoE
-additions, Quantile Balancing, Per-Head Muon, and K3's multimodal / 1M-context
-/ MXFP4 machinery.
-
-## Repository layout
-
-```
-kimi_k3_gdn2.py            The model: config, AttnRes backbone, DecoderLayer, KimiK3
-gated_deltanet_2/
-  core.py                  Gated Delta Rule-2 recurrence: recurrent oracle + 5 chunkwise cores
-  layer.py                 The GDN-2 token-mixer layer (projections, convs, gates, GQA folding)
-multi_latent_attention/
-  attention.py             Gated NoPE MLA (absorbed form) + streaming cache
-  moe.py                   Full-width grouped-GEMM MoE (routing base class + reference)
-  latent_moe.py            LatentMoE — routed experts in the shared latent
-pipeline/
-  config.py                YAML → typed ExperimentConfig
-  prepare_data.py          Stage 1: tokenize CodeParrot (or synthetic) into packed memmaps
-  data.py                  Stage 2: Grain loader over the memmaps
-  train.py                 Stage 3: training loop (data-parallel via shard_map)
-  optimizer.py             Muon/AdamW split
-  evaluate.py              Stage 4: val loss/ppl + autoregressive generation
-  checkpointing.py         Orbax composite checkpoints (model/optimizer/rngs/data iterator)
-configs/                   Ready-made experiment YAMLs (see table below)
-tests/                     Numerical verification suite (pytest)
-```
-
-## Quickstart
+The goal is to make §2 of the report executable and explainable: every module
+names the equation it implements, and every non-obvious line says *why* the
+paper does it that way. The defaults in `config.py` are the real 2.8T model;
+`KimiK3Config.tiny()` keeps the same structure at a size that runs on a laptop.
 
 ```bash
-pip install -r requirements.txt        # CPU; on GPU: pip install -U "jax[cuda12]"
+python demo.py                    # guided tour of every component
+python -m pytest tests/ -q        # 30 tests
+python -m kimi_k3.config          # parameter-count check against Table 1
 ```
 
-Fully offline smoke run (synthetic bytes, laptop CPU, minutes):
+## The architecture in one paragraph
 
-```bash
-python -m pipeline.prepare_data --config configs/tiny.yaml
-python -m pipeline.train        --config configs/tiny.yaml
-python -m pipeline.evaluate     --config configs/tiny.yaml --eval
-python -m pipeline.evaluate     --config configs/tiny.yaml --generate
-```
+K3 scales information flow along three axes, one mechanism each:
 
-Real training (streams CodeParrot from the HF Hub, BPE tokenizer, bf16):
+| Axis | Mechanism | What it replaces |
+|---|---|---|
+| **Sequence** | Hybrid Attention — 3 Kimi Delta Attention layers per Gated MLA layer | all-global attention |
+| **Depth** | Attention Residuals — layers *attend* over previous blocks | the additive residual stream |
+| **Width** | Stable LatentMoE — 16 of 896 routed experts, in a half-width latent | a dense FFN |
 
-```bash
-python -m pipeline.prepare_data --config configs/base.yaml
-python -m pipeline.train        --config configs/base.yaml           # --resume to continue
-python -m pipeline.evaluate     --config configs/base.yaml --generate \
-    --prompt "def quicksort(arr):" --max-new-tokens 128 --temperature 0.8 --top-p 0.95
-```
+Plus a native vision pathway at the input (MoonViT-V2) and Per-Head Muon as the
+optimizer. Together the report reports ~2.5× the scaling efficiency of Kimi K2.
 
-## Configs
+## Where each part of the paper lives
 
-| Config | Params | Target hardware | Notes |
-| --- | --- | --- | --- |
-| `tiny.yaml` | 2.5M | laptop CPU | Synthetic data, byte vocab — end-to-end smoke test |
-| `colab_t4.yaml` | 98M | 1× T4 (Colab) | bf16 for memory (T4 has no bf16 tensor cores) |
-| `kaggle_2xt4.yaml` | 98M | 2× T4 (Kaggle) | Same model, data-parallel across both GPUs |
-| `base.yaml` | 148M | one modern GPU | The reference single-GPU recipe |
-| `h200.yaml` | 1.1B | H200 141 GB | Sparse-MoE run with headroom to scale further |
+| Paper | File | Key equations |
+|---|---|---|
+| §2.1.1 Kimi Delta Attention | [`kda.py`](kimi_k3/kda.py) | Eq. 1 recurrence, Eqs. 3–4 chunkwise form, Eq. 5 lower-bounded decay, Eq. 6 output gate |
+| §2.1.2 Gated MLA (NoPE) | [`mla.py`](kimi_k3/mla.py) | Eq. 7 |
+| §2.2 Attention Residuals | [`attn_res.py`](kimi_k3/attn_res.py) | Eqs. 8–9 full form, Eq. 10 block form |
+| §2.3 Stable LatentMoE | [`moe.py`](kimi_k3/moe.py) | Eq. 11 |
+| §2.3.2 SiTU-GLU | [`layers.py`](kimi_k3/layers.py) | Eq. 12, App. B Eqs. 18–19 |
+| §2.3.3 Quantile Balancing | [`moe.py`](kimi_k3/moe.py) | Eqs. 13–14, App. C |
+| §2.4 Native Vision | [`vision.py`](kimi_k3/vision.py) | — |
+| §2.5 Per-Head Muon | [`muon.py`](kimi_k3/muon.py) | — |
+| §2, Table 1, MTP, §4.1.4 EAGLE-3 fusion | [`model.py`](kimi_k3/model.py), [`config.py`](kimi_k3/config.py) | Eq. 10 assembly |
 
-Constraints validated at startup: `data.seq_len` must be a multiple of
-`model.gdn_chunk_size` and at most `model.max_seq_len`; `model.vocab_size` must
-match the tokenized data; `train.batch_size` must divide by the device count.
+## The four ideas, briefly
 
-**Gradient checkpointing** (`model.remat`, enabled in the GPU configs): each
-decoder layer is recomputed during the backward pass instead of storing its
-activations — activation memory stops growing with depth, for ~1/3 extra
-forward compute. Gradients are identical to the un-checkpointed forward
-(tested); inference (`step`/`generate`) is unaffected.
+**Kimi Delta Attention** keeps a fixed-size associative memory `S ∈ R^{d_k×d_v}`
+instead of an attention matrix, updated per token by a delta rule with a
+*channel-wise* forget gate. K3's change over Kimi Linear is numerical: the
+log-decay is bounded below by `g_min = -5` via a scaled sigmoid rather than an
+unbounded negative-softplus. The chunkwise training form has to rescale keys by
+the *reciprocal* cumulative decay, which previously overflowed; bounding it puts
+`1/Γ` under `e^80` for a 16-token tile, inside the BF16 range, so every tile —
+diagonal included — becomes a dense matmul.
 
-## Inference API
+**Attention Residuals** does to depth what the Transformer did to time. A
+standard residual stream folds every layer output in with weight exactly 1, so
+by layer 90 the embedding is one summand among ninety. Instead each layer holds
+a learned pseudo-query `w_l ∈ R^d` and attends over the outputs of preceding
+blocks. Cost: one `d`-vector per layer.
 
-```python
-model = KimiK3(cfg, rngs=nnx.Rngs(0))
-logits, aux = model(input_ids)                      # training: full-sequence, chunkwise-parallel
+**Stable LatentMoE** runs routed experts in a half-width latent so K3 can afford
+896 of them with 16 active, while routing and the shared experts stay full-width.
+"Stable" is three fixes for what breaks at that sparsity: an RMSNorm before the
+up-projection, SiTU-GLU instead of SwiGLU (bounding both branches of the
+product at `β₁β₂ = 100`), and Quantile Balancing.
 
-out = model.generate(prompt_ids, max_new_tokens=128,  # streaming: O(1)/token for GDN-2 layers,
-                     temperature=0.8, top_p=0.95,     # O(context) for the few MLA layers
-                     eos_id=eos, key=jax.random.PRNGKey(0))
-```
+**Quantile Balancing** replaces the fixed-step load-balancing bias nudge with the
+exact bias that produces the target load, read off a quantile of the routing
+margins. Appendix C derives it as exact coordinate minimization of the dual of
+the balanced-assignment LP — which is why it has no learning rate and settles in
+a few steps even with ~10³ experts.
 
-`temperature=0` (default) decodes greedily; `eos_id` stops once every batch row
-has finished. Lower-level streaming: `model.init_cache(...)` + `model.step(...)`.
+## What is implemented, and what is not
 
-## Tests
+Implemented: everything in §2 (the full architecture), the MTP layer of Table 1,
+the EAGLE-3 feature-fusion projection of §4.1.4, Per-Head Muon with the cosine
+schedule of §3.3, and both the exact and histogram forms of the QB update.
 
-```bash
-pip install pytest
-JAX_PLATFORMS=cpu python -m pytest tests/    # ~2 min on CPU
-```
+Not implemented, and out of scope for an architecture reference: the post-training
+pipeline (SFT, RL, Multi-Teacher On-Policy Distillation), the MXFP4/MXFP8
+quantization-aware training of §4.1.4, the distributed-systems work of §5
+(expert-parallel training, sequence partitioning, sandbox infrastructure), and
+native-resolution image packing. K2's weight-clipping mechanism, referenced but
+not restated by the K3 report, is also absent.
 
-The suite verifies the numerics the docstrings promise: every chunkwise GDN-2
-core against a token-by-token scan **and** an independent float64 oracle
-(including the documented fp32 overflow limits), the folded GQA recurrence
-against the paper's repeat formulation, streaming decode against the training
-forward, MoE dispatch against a dense reference, and the Muon/AdamW parameter
-split.
+Correctness is checked rather than assumed: the chunkwise KDA form is tested
+against the token-by-token recurrence it is derived from, both attention layers'
+streaming decode paths are tested against their full forward pass, SiTU-GLU is
+tested against its stated bound, and QB is tested to actually reduce load
+imbalance.
+
+## A note on unstated hyper-parameters
+
+The report gives total (2.78T) and activated (104.2B) parameter counts but not
+the per-head sizes or the MLA latent ranks. Those counts pin them down:
+96 heads × 128 dims for both KDA and MLA, `q_lora_rank = 1536`,
+`kv_lora_rank = 512`, and shared experts at the routed experts' hidden width
+reproduce **2.78T total and 103.5B activated**. Every such value is marked
+`[inferred]` in `config.py`, and `python -m kimi_k3.config` prints the arithmetic.
+
+## Requirements
+
+`jax`, `flax` (NNX), `optax`. Developed against JAX 0.10 / Flax 0.12 on CPU;
+nothing is device-specific.
